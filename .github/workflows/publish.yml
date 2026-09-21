@@ -2,6 +2,12 @@
 # Container Registry (GHCR). Triggered by version tags (v*). The image bundles
 # the openlist-ext binary and a built OpenList-Frontend for linux/amd64 and
 # linux/arm64.
+#
+# Each platform is built on a NATIVE runner (ubuntu-24.04 for amd64,
+# ubuntu-24.04-arm for arm64) instead of QEMU emulation, which avoids the
+# SIGILL crashes Node's V8 JIT hits under emulated arm64. The per-platform
+# images are then united into a single multi-arch manifest with
+# `docker buildx imagetools create`.
 name: Publish Image
 
 on:
@@ -26,15 +32,17 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  publish:
-    name: Build & Push Multi-Arch Image
+  prepare:
+    name: Resolve or create build ref
     runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.ref.outputs.ref }}
+      is_version_tag: ${{ steps.ref.outputs.is_version_tag }}
+      version_tag: ${{ steps.ref.outputs.version_tag }}
     steps:
       - name: Resolve or create build ref
         id: ref
         env:
-          # Token used both for the ls-remote existence check and for pushing
-          # the auto-created tag (same credential path as actions/checkout).
           GH_TOKEN: ${{ github.token }}
         run: |
           # For tag pushes, github.ref is already refs/tags/v* and exists.
@@ -44,6 +52,7 @@ jobs:
           # release can be cut by simply dispatching with the desired tag,
           # rather than failing with an opaque "git failed with exit code 1".
           ref="${{ github.event.inputs.ref || github.ref }}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
           echo "Resolved ref: ${ref}"
           # Strip refs/heads/ or refs/tags/ prefix for lookups.
           name="${ref#refs/heads/}"
@@ -85,10 +94,28 @@ jobs:
             exit 1
           fi
 
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    outputs:
+      amd64_digest: ${{ steps.digest.outputs.amd64 }}
+      arm64_digest: ${{ steps.digest.outputs.arm64 }}
+    steps:
       - name: Checkout backend (openlist-ext)
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.ref || github.ref }}
+          ref: ${{ needs.prepare.outputs.ref }}
           path: openlist-ext
 
       - name: Checkout frontend (OpenList-Frontend)
@@ -97,9 +124,6 @@ jobs:
           repository: ${{ vars.OPENLIST_FRONTEND_REPO || 'sagerenn/OpenList-Frontend' }}
           ref: ${{ vars.OPENLIST_FRONTEND_REF || 'main' }}
           path: openlist-ext/frontend
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -111,26 +135,73 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || steps.ref.outputs.is_version_tag == 'true' }}
-            type=raw,value=${{ steps.ref.outputs.version_tag }},enable=${{ steps.ref.outputs.is_version_tag == 'true' }}
-            type=sha,format=short
-
-      - name: Build and push
+      # Build a single-platform image and push it by digest (no tag needed on
+      # the per-platform image; the manifest step will tag the united image).
+      - name: Build and push single-platform image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ github.workspace }}/openlist-ext
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          # TARGETOS/TARGETARCH are auto-injected by buildx per platform
-          # (the Dockerfile declares them as ARG), so no build-args needed.
+          outputs: type=image,push-by-digest=true,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.repositoryUrl }}
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,scope=${{ matrix.slug }},mode=max
+
+      - name: Read image digest
+        id: digest
+        run: |
+          # buildx writes the built image digest to BUILDX_METADATA_FILE when
+          # DOCKER_METADATA_OUTPUTS is set; otherwise parse the build summary.
+          # The most reliable source is the build-push-action's digest output.
+          echo "${{ matrix.slug }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          echo "Platform ${{ matrix.platform }} digest: ${{ steps.build.outputs.digest }}"
+
+  manifest:
+    name: Unite multi-arch manifest
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          repo="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          tags="${repo}:sha-${GITHUB_SHA::7}"
+          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ needs.prepare.outputs.is_version_tag }}" == "true" ]]; then
+            tags="${tags},${repo}:latest"
+          fi
+          if [[ "${{ needs.prepare.outputs.is_version_tag }}" == "true" ]]; then
+            tags="${tags},${repo}:${{ needs.prepare.outputs.version_tag }}"
+          fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "Final tags: ${tags}"
+
+      - name: Create and push multi-arch manifest
+        run: |
+          repo="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          # Unite the per-platform images (pushed by digest in the build job)
+          # into a single multi-arch manifest, tagged with each release tag.
+          IFS=',' read -ra TAG_LIST <<< "${{ steps.tags.outputs.tags }}"
+          sources=()
+          for tag in "${TAG_LIST[@]}"; do sources+=("-t" "$tag"); done
+          docker buildx imagetools create \
+            "${sources[@]}" \
+            "$repo@${{ needs.build.outputs.amd64_digest }}" \
+            "$repo@${{ needs.build.outputs.arm64_digest }}"
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${GITHUB_SHA::7}"
