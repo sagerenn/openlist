@@ -162,7 +162,7 @@ jobs:
 
   manifest:
     name: Unite multi-arch manifest
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - name: Log in to GHCR
