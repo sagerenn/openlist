@@ -16,7 +16,8 @@ on:
         default: ""
 
 permissions:
-  contents: read
+  # write so the workflow can create the release tag when one doesn't exist yet
+  contents: write
   packages: write
 
 env:
@@ -29,6 +30,58 @@ jobs:
     name: Build & Push Multi-Arch Image
     runs-on: ubuntu-latest
     steps:
+      - name: Resolve or create build ref
+        id: ref
+        run: |
+          # For tag pushes, github.ref is already refs/tags/v* and exists.
+          # For workflow_dispatch, prefer the supplied ref input and fall back
+          # to the default branch. If the ref names a version tag (v*) that
+          # doesn't exist yet, auto-create it at the default branch HEAD so a
+          # release can be cut by simply dispatching with the desired tag,
+          # rather than failing with an opaque "git failed with exit code 1".
+          ref="${{ github.event.inputs.ref || github.ref }}"
+          echo "Resolved ref: ${ref}"
+          # Strip refs/heads/ or refs/tags/ prefix for lookups.
+          name="${ref#refs/heads/}"
+          name="${name#refs/tags/}"
+
+          exists=false
+          if gh api "repos/${{ github.repository }}/git/ref/heads/${name}" >/dev/null 2>&1 \
+             || gh api "repos/${{ github.repository }}/git/ref/tags/${name}" >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          if [ "$exists" = "true" ]; then
+            echo "Tag/branch '${name}' already exists; using it."
+            if [[ "$name" == v* ]]; then
+              echo "is_version_tag=true" >> "$GITHUB_OUTPUT"
+              echo "version_tag=${name}" >> "$GITHUB_OUTPUT"
+            fi
+          elif [[ "$name" == v* ]]; then
+            echo "is_version_tag=true" >> "$GITHUB_OUTPUT"
+            echo "version_tag=${name}" >> "$GITHUB_OUTPUT"
+            echo "Tag '${name}' not found; auto-creating it at the default branch HEAD."
+            # Fetch the default branch SHA and create an annotated tag there.
+            default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
+            sha=$(gh api "repos/${{ github.repository }}/git/ref/heads/${default_branch}" --jq '.object.sha')
+            gh api --method POST "repos/${{ github.repository }}/git/tags" \
+              -f tag="${name}" \
+              -f message="${name}" \
+              -f object="${sha}" \
+              -f type="commit" >/dev/null
+            # Create the ref pointing at the tag object.
+            tag_sha=$(gh api "repos/${{ github.repository }}/git/ref/tags/${name}" --jq '.object.sha')
+            gh api --method POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/${name}" \
+              -f sha="${tag_sha}" >/dev/null
+            echo "Created tag '${name}' at ${sha}."
+          else
+            echo "::error::Ref '${ref}' not found in ${{ github.repository }} and is not a version tag (v*). Pass an existing branch/tag or a v* tag to auto-create."
+            exit 1
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Checkout backend (openlist-ext)
         uses: actions/checkout@v4
         with:
@@ -62,7 +115,8 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') || steps.ref.outputs.is_version_tag == 'true' }}
+            type=raw,value=${{ steps.ref.outputs.version_tag }},enable=${{ steps.ref.outputs.is_version_tag == 'true' }}
             type=sha,format=short
 
       - name: Build and push
