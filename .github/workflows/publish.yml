@@ -32,6 +32,10 @@ jobs:
     steps:
       - name: Resolve or create build ref
         id: ref
+        env:
+          # Token used both for the ls-remote existence check and for pushing
+          # the auto-created tag (same credential path as actions/checkout).
+          GH_TOKEN: ${{ github.token }}
         run: |
           # For tag pushes, github.ref is already refs/tags/v* and exists.
           # For workflow_dispatch, prefer the supplied ref input and fall back
@@ -45,9 +49,12 @@ jobs:
           name="${ref#refs/heads/}"
           name="${name#refs/tags/}"
 
+          repo="https://${GITHUB_ACTOR}:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          # Does the ref already exist as a branch or tag?
           exists=false
-          if gh api "repos/${{ github.repository }}/git/ref/heads/${name}" >/dev/null 2>&1 \
-             || gh api "repos/${{ github.repository }}/git/ref/tags/${name}" >/dev/null 2>&1; then
+          if git ls-remote --exit-code --heads "$repo" "$name" >/dev/null 2>&1 \
+             || git ls-remote --exit-code --tags "$repo" "$name" >/dev/null 2>&1; then
             exists=true
           fi
 
@@ -61,26 +68,18 @@ jobs:
             echo "is_version_tag=true" >> "$GITHUB_OUTPUT"
             echo "version_tag=${name}" >> "$GITHUB_OUTPUT"
             echo "Tag '${name}' not found; auto-creating it at the default branch HEAD."
-            # Fetch the default branch SHA and create an annotated tag there.
-            default_branch=$(gh api "repos/${{ github.repository }}" --jq '.default_branch')
-            sha=$(gh api "repos/${{ github.repository }}/git/ref/heads/${default_branch}" --jq '.object.sha')
-            gh api --method POST "repos/${{ github.repository }}/git/tags" \
-              -f tag="${name}" \
-              -f message="${name}" \
-              -f object="${sha}" \
-              -f type="commit" >/dev/null
-            # Create the ref pointing at the tag object.
-            tag_sha=$(gh api "repos/${{ github.repository }}/git/ref/tags/${name}" --jq '.object.sha')
-            gh api --method POST "repos/${{ github.repository }}/git/refs" \
-              -f ref="refs/tags/${name}" \
-              -f sha="${tag_sha}" >/dev/null
+            # Shallow-fetch the default branch, tag its HEAD, and push the tag.
+            tmp=$(mktemp -d)
+            git clone --depth 1 --branch "${{ github.event.repository.default_branch }}" "$repo" "$tmp"
+            sha=$(git -C "$tmp" rev-parse HEAD)
+            git -C "$tmp" tag -a "$name" -m "$name"
+            git -C "$tmp" push origin "$name"
+            rm -rf "$tmp"
             echo "Created tag '${name}' at ${sha}."
           else
             echo "::error::Ref '${ref}' not found in ${{ github.repository }} and is not a version tag (v*). Pass an existing branch/tag or a v* tag to auto-create."
             exit 1
           fi
-        env:
-          GH_TOKEN: ${{ github.token }}
 
       - name: Checkout backend (openlist-ext)
         uses: actions/checkout@v4
