@@ -168,17 +168,32 @@ func isLBUpload(c *gin.Context) bool {
 	return c.GetHeader("X-LB-Group") != "" || c.Query("lb_group") != ""
 }
 
-// adminAuth guards the admin API with the configured admin token.
+// adminAuth guards the admin API. It accepts either:
+//   - the configured static admin token (Config.AdminToken), or
+//   - a valid OpenList admin user's session token, validated in-process via
+//     the loopback client's /api/me (role == ADMIN).
+//
+// The second path lets the OpenList-Frontend manage the extension features
+// with the same token the logged-in admin already uses for OpenList, so no
+// separate extension token needs to be configured or entered.
 func (s *Server) adminAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tok := c.GetHeader("Authorization")
 		if tok == "" {
 			tok = c.Query("token")
 		}
-		if tok == "" || tok != s.Config.AdminToken {
+		if tok == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "unauthorized"})
 			return
 		}
-		c.Next()
+		if tok == s.Config.AdminToken && s.Config.AdminToken != "" {
+			c.Next()
+			return
+		}
+		if s.Client != nil && s.Client.IsAdminToken(c.Request.Context(), tok) {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"code": 401, "message": "unauthorized"})
 	}
 }

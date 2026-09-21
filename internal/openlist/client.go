@@ -131,3 +131,33 @@ func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.do(ctx, http.MethodGet, "/api/me", nil, "")
 	return err
 }
+
+// meResp is the subset of /api/me's data the extension cares about.
+type meResp struct {
+	Role int `json:"role"`
+}
+
+// IsAdminToken reports whether the given token belongs to an OpenList admin
+// user, by calling /api/me and checking the role. It returns false on any
+// error (treat unprovable tokens as non-admin). Used by the extension's
+// adminAuth to accept a logged-in admin's session token in addition to the
+// configured static admin token, so the frontend can manage extension
+// features with the same token it already uses for OpenList.
+func (c *Client) IsAdminToken(ctx context.Context, token string) bool {
+	if token == "" {
+		return false
+	}
+	saved := c.Token
+	c.Token = token
+	defer func() { c.Token = saved }()
+	out, err := c.do(ctx, http.MethodGet, "/api/me", nil, "")
+	if err != nil {
+		return false
+	}
+	var me meResp
+	if err := json.Unmarshal(out.Data, &me); err != nil {
+		return false
+	}
+	// OpenList UserRole: 0=GENERAL, 1=GUEST, 2=ADMIN.
+	return me.Role == 2
+}
