@@ -69,9 +69,13 @@ jobs:
             echo "version_tag=${name}" >> "$GITHUB_OUTPUT"
             echo "Tag '${name}' not found; auto-creating it at the default branch HEAD."
             # Shallow-fetch the default branch, tag its HEAD, and push the tag.
+            # Set a git identity explicitly: the runner has none configured
+            # before actions/checkout runs, and `git tag -a` requires one.
             tmp=$(mktemp -d)
             git clone --depth 1 --branch "${{ github.event.repository.default_branch }}" "$repo" "$tmp"
             sha=$(git -C "$tmp" rev-parse HEAD)
+            git -C "$tmp" config user.name "github-actions[bot]"
+            git -C "$tmp" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git -C "$tmp" tag -a "$name" -m "$name"
             git -C "$tmp" push origin "$name"
             rm -rf "$tmp"
