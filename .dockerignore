@@ -1,0 +1,11 @@
+# Exclude build artifacts and VCS from the Docker build context.
+.git
+.github
+data
+*.db
+*.tar.gz
+dist/
+frontend/node_modules
+frontend/dist
+frontend/.git
+# Keep frontend/ itself (source is needed by Stage 1) but drop its heavy dirs.

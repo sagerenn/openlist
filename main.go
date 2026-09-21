@@ -32,6 +32,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -49,6 +50,11 @@ import (
 
 func main() {
 	cfg := config.Default()
+	// Remember the default DBPath so we can detect whether the operator
+	// overrode it via --db or DB_PATH. When not overridden, the extension
+	// database lives inside the OpenList data directory (so DATA_DIR alone
+	// is enough to relocate all state, and the binary works from any CWD).
+	defaultDBPath := cfg.DBPath
 	flag.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "address the embedded server binds")
 	flag.StringVar(&cfg.LoopbackAddr, "loopback", cfg.LoopbackAddr, "http://host:port form of listen, for in-process privileged calls")
 	flag.StringVar(&cfg.AdminToken, "admin-token", cfg.AdminToken, "OpenList admin token for privileged in-process ops")
@@ -73,6 +79,14 @@ func main() {
 	}
 	if v := os.Getenv("DATA_DIR"); v != "" {
 		cfg.DataDir = v
+	}
+
+	// If the operator did not explicitly place the extension database,
+	// co-locate it with OpenList's data directory. This makes DATA_DIR the
+	// single knob for relocating all state (config.json, OpenList's DB, and
+	// the extension DB), which is what containerized and CI runs expect.
+	if cfg.DBPath == defaultDBPath {
+		cfg.DBPath = filepath.Join(cfg.DataDir, "openlist-ext.db")
 	}
 
 	// Boot OpenList's internals in-process (config, DB, storages, data).

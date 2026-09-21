@@ -10,6 +10,8 @@
 package db
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 
 	"gorm.io/driver/sqlite"
@@ -42,6 +44,14 @@ func Init(path string) error {
 	defer mu.Unlock()
 	if db != nil {
 		return nil
+	}
+	// Ensure the parent directory exists so an explicit DB_PATH pointing at
+	// a not-yet-existing directory (common in fresh containers/CI) does not
+	// fail with "unable to open database file: no such file or directory".
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+			return mkErr
+		}
 	}
 	db, err = gorm.Open(sqlite.Open(path), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),

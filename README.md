@@ -24,6 +24,24 @@ engine, calls `server.Init(engine)` to mount OpenList's routes, and registers
 the extension's feature middleware + admin API on the same engine. One
 process, one port.
 
+### Storage loading (why `BootOpenList` calls `OutOpenListInit`)
+
+OpenList's `StoragesLoaded` middleware blocks every non-whitelisted path
+(`/api/*`, `/d/*`, `/p/*`, …) on a "storages loaded" signal that is only sent
+by `bootstrap.Start` → `LoadStorages`. Because the extension mounts OpenList's
+routes on its **own** gin engine (via `server.Init`) instead of calling
+`bootstrap.Start`, that signal would never fire and every API call — including
+login — would hang forever.
+
+`BootOpenList` solves this with public packages only: it disables OpenList's
+built-in HTTP listener (`scheme.http_port = -1` in `config.json`) and invokes
+the public `cmd.OutOpenListInit` hook in a goroutine. `OutOpenListInit` is
+OpenList's sanctioned "start from an external embedder" entry point (used by
+OpenList-Mobile); with the listener disabled it runs `LoadStorages` +
+`InitTaskManager` + `InitOfflineDownloadTools` — sending the signal and making
+the embedded backend fully functional — **without** spawning a duplicate HTTP
+server.
+
 The feature middleware (`apiKeyAuth` → `domainAuth` → `listPermGuard` →
 `applyTTL`) runs as global gin middleware **before** OpenList's route
 handlers. For requests it doesn't govern it calls `c.Next()` and OpenList's
@@ -83,7 +101,31 @@ ADMIN_TOKEN=<your-admin-token> ./openlist-ext
 On first run, OpenList creates `./data/config.json`, its own `./data/data.db`,
 and an `admin` user (the initial password is printed to stdout). A placeholder
 web UI is created at `./data/dist/index.html`; drop a built OpenList frontend
-there to serve the real UI.
+there to serve the real UI. To set a deterministic admin password (useful for
+containers and CI), set `OPENLIST_ADMIN_PASSWORD`; the initial `admin` user's
+password is then that value on first run.
+
+## Docker
+
+A multi-stage, multi-arch Dockerfile bundles the binary with a built
+OpenList-Frontend. The entrypoint seeds the frontend dist into the data
+directory on first start, so the manage panel (including the Extension
+section) is served from the same origin as the API on port 5245.
+
+```bash
+# Local single-arch build.
+docker build -t openlist-ext .
+
+# Multi-arch build + push (requires buildx + QEMU).
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/<owner>/openlist-ext:latest --push .
+
+# Run. State lives in the mounted /data volume.
+docker run -p 5245:5245 -v openlist-data:/data \
+  -e OPENLIST_ADMIN_PASSWORD=changeme ghcr.io/<owner>/openlist-ext:latest
+```
+
+The publish workflow (below) automates the multi-arch build + push to GHCR on
+version tags.
 
 ### Configuration
 
@@ -96,6 +138,7 @@ there to serve the real UI.
 | `-admin-token`  | `ADMIN_TOKEN`    | (empty)                  | OpenList admin token for privileged in-process ops   |
 | `-reaper-interval` | —             | `60`                     | TTL reaper interval (seconds)                        |
 | `-reaper-batch` | —                | `100`                    | TTL reaper batch size                                |
+| —               | `OPENLIST_ADMIN_PASSWORD` | (random)      | Initial admin password on first run (OpenList core)  |
 
 ## Admin API
 
@@ -151,6 +194,62 @@ exercise every feature end-to-end through the engine's HTTP surface using a
 stub stand-in for OpenList's routes; the integration test boots the **real**
 OpenList in-process and verifies `/ping` and `/ext/healthz` coexist on one
 engine.
+
+## CI/CD
+
+Three GitHub workflows cover build, publish, and end-to-end testing.
+
+| Workflow | Repo | Trigger | What it does |
+|---|---|---|---|
+| `ci.yml` | openlist-ext | push/PR to `main` | `go vet` + `go build` + `go test -race` |
+| `publish.yml` | openlist-ext | tag `v*` / dispatch | Multi-arch (`linux/amd64,linux/arm64`) Docker build + push to GHCR |
+| `e2e.yml` | OpenList-Frontend | push/PR to `main` | Builds the backend binary + frontend dist, boots the backend, runs Playwright E2E against it |
+
+### `ci.yml` — build & test
+
+Runs on every push and pull request to `main`. Sets up Go from `go.mod`,
+downloads deps, then `go vet ./...`, `go build ./...`, and
+`go test -race -count=1 ./...`. Because the extension embeds OpenList
+in-process, a clean build + test here guards both the extension code and the
+public OpenList API surface it depends on.
+
+### `publish.yml` — multi-arch image to GHCR
+
+Triggered by `v*` tags (or `workflow_dispatch`). Checks out both the backend
+(openlist-ext) and the frontend (OpenList-Frontend), sets up QEMU + buildx,
+logs in to the GitHub Container Registry, and builds a
+`linux/amd64,linux/arm64` image via `docker/build-push-action@v6`. Tags are
+derived from the git tag (`v1.2.3` → `1.2.3`), plus `latest` and the short
+SHA. The Dockerfile's `TARGETOS`/`TARGETARCH` ARGs are auto-injected by
+buildx per platform, so no explicit `build-args` are needed.
+
+Override the frontend repo/ref with the `OPENLIST_FRONTEND_REPO` and
+`OPENLIST_FRONTEND_REF` repository variables when forking.
+
+### `e2e.yml` — frontend E2E vs the backend
+
+Lives in the OpenList-Frontend repo and runs on push/PR to `main`. It is the
+end-to-end check that the frontend works against a real openlist-ext backend:
+
+1. Check out the frontend and the backend (into `./backend`).
+2. Build the `openlist-ext` binary (`go build`).
+3. `pnpm install` + `pnpm build` the frontend dist.
+4. Seed the dist into the backend's data dir so `BootOpenList` serves the
+   real UI (with the Extension section) instead of the placeholder.
+5. Start the backend with `OPENLIST_ADMIN_PASSWORD=admin` (deterministic
+   login: `admin` / `admin`).
+6. Wait for `/ext/healthz` to return 200.
+7. `pnpm e2e:install` (Playwright chromium) + `pnpm e2e`.
+
+The Playwright suite (`e2e/extension.spec.ts`) verifies: `/ext/healthz`
+returns 200; `/` serves the built frontend; the **Extension** menu group is
+visible when `/ext/healthz` is reachable; and it is **hidden** when
+`/ext/healthz` is intercepted as 404 (forward compatibility with stock
+OpenList, which has no `/ext/*`). Selectors are English text-based, pinned by
+forcing locale `en-US` and `localStorage("lang") = "en"`.
+
+Override the backend repo/ref with the `OPENLIST_BACKEND_REPO` and
+`OPENLIST_BACKEND_REF` repository variables when forking.
 
 ## Project layout
 
