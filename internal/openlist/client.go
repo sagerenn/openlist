@@ -24,6 +24,11 @@ type Client struct {
 	BaseURL string
 	Token   string
 	HTTP    *http.Client
+	// tokens, when set, supplies a refreshable admin JWT used for
+	// authenticated calls. On a 401 ("token is invalidated") the client
+	// refreshes the JWT once and retries. When nil, the static Token is
+	// used as-is.
+	tokens *TokenManager
 }
 
 // New returns a Client targeting baseURL with the given admin token.
@@ -35,6 +40,24 @@ func New(baseURL, token string) *Client {
 	}
 }
 
+// SetTokenManager attaches a refreshable admin-JWT manager. When set, the
+// client uses the manager's JWT for authenticated calls and refreshes it on
+// a 401.
+func (c *Client) SetTokenManager(m *TokenManager) {
+	c.tokens = m
+}
+
+// effectiveToken returns the token to send on a request, preferring a
+// refreshable JWT from the manager when one is available.
+func (c *Client) effectiveToken(ctx context.Context) string {
+	if c.tokens != nil && c.tokens.Enabled() {
+		if tok, err := c.tokens.Get(ctx); err == nil {
+			return tok
+		}
+	}
+	return c.Token
+}
+
 // apiResp mirrors OpenList's standard response envelope.
 type apiResp struct {
 	Code    int             `json:"code"`
@@ -42,25 +65,57 @@ type apiResp struct {
 	Data    json.RawMessage `json:"data"`
 }
 
-// do performs an authenticated request and decodes the envelope.
+// do performs an authenticated request and decodes the envelope. When a
+// TokenManager is attached and the request fails with a 401 (the cached
+// admin JWT has expired), it refreshes the JWT and retries once. The body
+// is buffered so the retry can replay it.
 func (c *Client) do(ctx context.Context, method, path string, body io.Reader, contentType string) (apiResp, error) {
-	var out apiResp
-	u := c.BaseURL + path
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
+	var buf []byte
+	if body != nil {
+		var err error
+		buf, err = io.ReadAll(body)
+		if err != nil {
+			return apiResp{}, err
+		}
+	}
+	doOnce := func(token string) (apiResp, int, error) {
+		var out apiResp
+		u := c.BaseURL + path
+		var bodyReader io.Reader
+		if buf != nil {
+			bodyReader = bytes.NewReader(buf)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, u, bodyReader)
+		if err != nil {
+			return out, 0, err
+		}
+		req.Header.Set("Authorization", token)
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			return out, 0, err
+		}
+		defer resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, resp.StatusCode, fmt.Errorf("openlist: decode response: %w", err)
+		}
+		return out, resp.StatusCode, nil
+	}
+	out, status, err := doOnce(c.effectiveToken(ctx))
 	if err != nil {
 		return out, err
 	}
-	req.Header.Set("Authorization", c.Token)
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return out, err
-	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return out, fmt.Errorf("openlist: decode response: %w", err)
+	// Retry once on a 401 from an expired/invalid admin JWT.
+	if status == http.StatusUnauthorized && c.tokens != nil && c.tokens.Enabled() {
+		if tok, rerr := c.tokens.Refresh(ctx); rerr == nil {
+			out2, _, err2 := doOnce(tok)
+			if err2 == nil {
+				return out2, nil
+			}
+			return out, err2
+		}
 	}
 	if out.Code != 200 {
 		return out, fmt.Errorf("openlist: api error code=%d msg=%s", out.Code, out.Message)
@@ -103,7 +158,7 @@ func (c *Client) UploadFile(ctx context.Context, fullPath string, r io.Reader, s
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", c.Token)
+	req.Header.Set("Authorization", c.effectiveToken(ctx))
 	req.Header.Set("File-Path", url.PathEscape(fullPath))
 	req.Header.Set("As-Task", "false")
 	req.Header.Set("Overwrite", "true")
@@ -147,11 +202,24 @@ func (c *Client) IsAdminToken(ctx context.Context, token string) bool {
 	if token == "" {
 		return false
 	}
-	saved := c.Token
-	c.Token = token
-	defer func() { c.Token = saved }()
-	out, err := c.do(ctx, http.MethodGet, "/api/me", nil, "")
+	// Probe the given token directly (not the client's cached admin JWT),
+	// so adminAuth can validate a frontend-supplied session token.
+	var out apiResp
+	u := c.BaseURL + "/api/me"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
+		return false
+	}
+	req.Header.Set("Authorization", token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false
+	}
+	if out.Code != 200 {
 		return false
 	}
 	var me meResp

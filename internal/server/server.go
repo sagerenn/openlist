@@ -30,6 +30,7 @@
 package server
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -48,17 +49,46 @@ type Server struct {
 	// tests it may be a proxy to a stub OpenList. It is never an HTTP call
 	// to a separate running OpenList in production.
 	forward gin.HandlerFunc
+
+	// tokens mints and caches a real OpenList admin JWT for privileged
+	// in-process operations (reaper deletes, LB uploads, and forwarding
+	// API-key-authenticated file ops to OpenList's core as admin). When
+	// disabled (no admin password), callers fall back to Config.AdminToken,
+	// which must then itself be a valid admin JWT.
+	tokens *openlist.TokenManager
 }
 
 // New constructs a Server. The loopback client is built from the config's
 // LoopbackAddr (the address the engine will listen on) and the admin token.
+// When AdminPassword is set, a TokenManager is created so the extension can
+// obtain and refresh a real admin JWT for forwarding to OpenList's core
+// (which only accepts JWTs, not the static AdminToken).
 func New(cfg config.Config) (*Server, error) {
 	s := &Server{
 		Config: cfg,
 		Client: openlist.New(cfg.LoopbackAddr, cfg.AdminToken),
 	}
+	if cfg.AdminPassword != "" {
+		s.tokens = openlist.NewTokenManager(s.Client, cfg.AdminUser, cfg.AdminPassword)
+		s.Client.SetTokenManager(s.tokens)
+	}
 	s.forward = func(c *gin.Context) { c.Next() }
 	return s, nil
+}
+
+// adminToken returns a valid admin JWT for forwarding to OpenList's core.
+// It prefers the refreshable TokenManager (logging in if needed); when that
+// is disabled it falls back to the static Config.AdminToken (which must then
+// be a valid admin JWT). On error it returns the static token as a
+// best-effort so the request still proceeds (and fails with a clear 401 if
+// the token is invalid).
+func (s *Server) adminToken(ctx context.Context) string {
+	if s.tokens != nil && s.tokens.Enabled() {
+		if tok, err := s.tokens.Get(ctx); err == nil {
+			return tok
+		}
+	}
+	return s.Config.AdminToken
 }
 
 // SetForwarder overrides the terminal forward handler. Used by tests to
@@ -79,23 +109,28 @@ func (s *Server) Engine(mountOpenList bool) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 
+	// Feature middleware must be registered on the engine BEFORE OpenList's
+	// routes are mounted. gin's RouterGroup captures a snapshot of the
+	// parent's handler chain at Group()/registration time (combineHandlers
+	// copies the slice), so middleware added via Use() AFTER olInit(r) never
+	// reaches OpenList's already-registered routes — which would leave API
+	// keys, list-permission, and TTL enforcement silently inactive on every
+	// /api/fs/* call. Registering it first ensures it is copied into every
+	// route group OpenList creates. The middleware itself is a no-op
+	// (c.Next()) for paths it does not govern (/ext/*, auth, admin, ...).
+	r.Use(s.featureMiddleware())
+
 	// Mount OpenList's full route tree onto this engine. In production this
 	// is what makes the extension "work alone" — OpenList runs in-process.
 	if mountOpenList {
 		olInit(r)
 	}
 
-	// Extension health + admin API (explicit routes; the feature middleware
-	// below skips /ext/* paths so these are unaffected).
+	// Extension health + admin API. The feature middleware above skips
+	// /ext/* paths, so these are unaffected by it.
 	r.GET("/ext/healthz", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
 	admin := r.Group("/ext/admin", s.adminAuth())
 	s.registerAdminRoutes(admin)
-
-	// Feature middleware runs globally, before OpenList's route handlers. It
-	// only acts on file-operation paths (/api/fs/*, /d/*, /p/*) and skips
-	// /ext/* internal paths. For everything else it calls c.Next() into
-	// OpenList's own handlers (or the test stub forwarder).
-	r.Use(s.featureMiddleware())
 
 	return r
 }

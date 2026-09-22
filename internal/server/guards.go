@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -99,6 +100,13 @@ func (s *Server) applyTTL(c *gin.Context, forward gin.HandlerFunc) {
 				filePath := c.GetHeader("File-Path")
 				if filePath == "" {
 					filePath = c.Query("file_path")
+				}
+				// OpenList's put handler URL-decodes File-Path before storing
+				// the file, so the TTL record must store the decoded path too
+				// — otherwise the reaper later tries to remove the still-
+				// escaped path and silently misses the file.
+				if decoded, err := url.PathUnescape(filePath); err == nil {
+					filePath = decoded
 				}
 				if filePath != "" {
 					// Optional per-file TTL override (seconds). When present

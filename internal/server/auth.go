@@ -39,8 +39,10 @@ func (s *Server) apiKeyAuth() gin.HandlerFunc {
 		c.Set(ctxAuthSrc, "apikey")
 		// Forward as admin so OpenList performs the actual file op; the
 		// extension enforces the key's scope in listPermGuard / a scope
-		// check below.
-		c.Request.Header.Set("Authorization", s.Config.AdminToken)
+		// check below. OpenList's core Auth middleware only accepts real
+		// admin JWTs (not the static AdminToken), so use the refreshable
+		// admin JWT from the TokenManager when available.
+		c.Request.Header.Set("Authorization", s.adminToken(c.Request.Context()))
 		if !s.checkScope(c, k) {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": 403, "message": "api key scope denied"})
 			return

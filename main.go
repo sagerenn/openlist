@@ -74,6 +74,16 @@ func main() {
 	if v := os.Getenv("ADMIN_TOKEN"); v != "" {
 		cfg.AdminToken = v
 	}
+	if v := os.Getenv("ADMIN_USER"); v != "" {
+		cfg.AdminUser = v
+	}
+	// OPENLIST_ADMIN_PASSWORD is the same env var OpenList's own bootstrap
+	// reads to seed the admin password, so a single variable provisions
+	// both sides. When set, the extension logs in as the admin to obtain a
+	// real JWT for forwarding to OpenList's core (which only accepts JWTs).
+	if v := os.Getenv("OPENLIST_ADMIN_PASSWORD"); v != "" {
+		cfg.AdminPassword = v
+	}
 	if v := os.Getenv("DB_PATH"); v != "" {
 		cfg.DBPath = v
 	}
