@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,7 +101,18 @@ func (s *Server) applyTTL(c *gin.Context, forward gin.HandlerFunc) {
 					filePath = c.Query("file_path")
 				}
 				if filePath != "" {
-					_ = ttl.RecordUpload(uid.(uint), filePath, time.Now())
+					// Optional per-file TTL override (seconds). When present
+					// and > 0, the uploaded file's expiry uses this duration
+					// instead of the user's configured default; when absent
+					// or <= 0, the user's default applies. The header is
+					// URL-decoded-safe (a plain integer).
+					var override int64
+					if raw := strings.TrimSpace(c.GetHeader("X-Ttl")); raw != "" {
+						if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+							override = v
+						}
+					}
+					_ = ttl.RecordUploadWithTTL(uid.(uint), filePath, time.Now(), override)
 				}
 			}
 		}

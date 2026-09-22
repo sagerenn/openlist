@@ -56,6 +56,59 @@ func TestRecordUploadDisabledIsNoop(t *testing.T) {
 	assert.False(t, has)
 }
 
+func TestRecordUploadWithTTLOverride(t *testing.T) {
+	cleanup := testutil.SetupDB(t)
+	defer cleanup()
+
+	// User default is 100s fixed.
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 7, Enabled: true, Mode: ModeFixed, Duration: 100}))
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// No override -> user default (now + 100s).
+	require.NoError(t, RecordUploadWithTTL(7, "/dflt.txt", now, 0))
+	var dflt FileTTLRecord
+	require.NoError(t, dbFirstByPath("/dflt.txt", &dflt))
+	assert.Equal(t, now.Add(100*time.Second), dflt.ExpiresAt)
+
+	// Override of 30s -> now + 30s, not the user's 100s.
+	require.NoError(t, RecordUploadWithTTL(7, "/ovr.txt", now, 30))
+	var ovr FileTTLRecord
+	require.NoError(t, dbFirstByPath("/ovr.txt", &ovr))
+	assert.Equal(t, now.Add(30*time.Second), ovr.ExpiresAt)
+
+	// Negative override is ignored -> user default applies.
+	require.NoError(t, RecordUploadWithTTL(7, "/neg.txt", now, -5))
+	var neg FileTTLRecord
+	require.NoError(t, dbFirstByPath("/neg.txt", &neg))
+	assert.Equal(t, now.Add(100*time.Second), neg.ExpiresAt)
+}
+
+func TestRecordUploadWithTTLOverrideNoopWhenDisabled(t *testing.T) {
+	cleanup := testutil.SetupDB(t)
+	defer cleanup()
+
+	// User has TTL off; an override cannot force it on.
+	require.NoError(t, RecordUploadWithTTL(8, "/off.txt", time.Now(), 30))
+	has, err := HasRecord("/off.txt")
+	require.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestRecordUploadWithTTLOverrideAccessMode(t *testing.T) {
+	cleanup := testutil.SetupDB(t)
+	defer cleanup()
+
+	// User in access mode with 50s default; override to 20s keeps access mode
+	// but uses the per-file duration.
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 9, Enabled: true, Mode: ModeAccess, Duration: 50}))
+	t0 := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, RecordUploadWithTTL(9, "/a.txt", t0, 20))
+	var r FileTTLRecord
+	require.NoError(t, dbFirstByPath("/a.txt", &r))
+	assert.Equal(t, t0.Add(20*time.Second), r.ExpiresAt)
+	assert.Equal(t, ModeAccess, r.Mode)
+}
+
 func TestRecordAccessSlidesAccessMode(t *testing.T) {
 	cleanup := testutil.SetupDB(t)
 	defer cleanup()
