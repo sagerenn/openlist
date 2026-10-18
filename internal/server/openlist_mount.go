@@ -43,6 +43,12 @@ import (
 // lifetime of the process, which is exactly what we want.
 func BootOpenList(dataDir string) error {
 	flags.DataDir = dataDir
+	// Mirror all OpenList logging to stdout as well as the log file. Log()
+	// (called by cmd.Init below) otherwise redirects logrus and the standard
+	// log package to <dataDir>/log/log.log only, so a startup log.Fatal
+	// (ours or OpenList's) would exit the container with no visible error
+	// in docker logs.
+	flags.LogStd = true
 
 	// Phase 1: generate the default config.json and initialize OpenList
 	// (database, admin user, settings). This does NOT mount routes, so the
