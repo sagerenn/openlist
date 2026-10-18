@@ -53,9 +53,15 @@ FROM alpine:3.20 AS runtime
 
 # ca-certificates for outbound TLS (storages, /api/me loopback is in-process
 # but drivers may call remote endpoints); tzdata for sane default times.
+# /data is created here owned by openlist: Docker's volume copy-up seeds a
+# fresh (anonymous or named) volume with this ownership, so the unprivileged
+# container user can write to it. Without this, a new volume is root-owned
+# and the entrypoint's mkdir fails.
 RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S openlist \
-    && adduser -S -G openlist -h /opt/openlist-ext openlist
+    && adduser -S -G openlist -h /opt/openlist-ext openlist \
+    && mkdir -p /data \
+    && chown openlist:openlist /data
 
 WORKDIR /opt/openlist-ext
 

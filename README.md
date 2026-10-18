@@ -124,6 +124,12 @@ docker run -p 5245:5245 -v openlist-data:/data \
   -e OPENLIST_ADMIN_PASSWORD=changeme ghcr.io/<owner>/openlist-ext:latest
 ```
 
+The container runs as the unprivileged `openlist` user (uid 100, gid 101).
+Named volumes are seeded with that ownership on first use, but if you bind
+mount a host directory (`-v /host/path:/data`), it must be writable by that
+user — e.g. `chown -R 100:101 /host/path` — or run with
+`--user $(id -u):$(id -g)` to match the directory's owner.
+
 The publish workflow (below) automates the multi-arch build + push to GHCR on
 version tags.
 
