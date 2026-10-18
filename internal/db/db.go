@@ -14,7 +14,11 @@ import (
 	"path/filepath"
 	"sync"
 
-	"gorm.io/driver/sqlite"
+	// Pure-Go SQLite driver (same one OpenList's core uses). The binary is
+	// built with CGO_ENABLED=0 — the cgo-based gorm.io/driver/sqlite
+	// (mattn/go-sqlite3) compiles to a stub in that mode and fails at
+	// runtime with "go-sqlite3 requires cgo to work".
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )

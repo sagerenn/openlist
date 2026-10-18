@@ -5,9 +5,9 @@ go 1.25.0
 require (
 	github.com/OpenListTeam/OpenList/v4 v4.2.6
 	github.com/gin-gonic/gin v1.12.0
+	github.com/glebarez/sqlite v1.11.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/stretchr/testify v1.12.1
-	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.2
 )
 
@@ -126,7 +126,6 @@ require (
 	github.com/gin-contrib/cors v1.7.7 // indirect
 	github.com/gin-contrib/sse v1.1.0 // indirect
 	github.com/glebarez/go-sqlite v1.21.2 // indirect
-	github.com/glebarez/sqlite v1.11.0 // indirect
 	github.com/go-chi/chi/v5 v5.3.1 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
@@ -300,6 +299,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gorm.io/driver/mysql v1.6.0 // indirect
 	gorm.io/driver/postgres v1.6.2 // indirect
+	gorm.io/driver/sqlite v1.6.0 // indirect
 	lukechampine.com/blake3 v1.1.7 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect
