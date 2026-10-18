@@ -1,7 +1,8 @@
 # Build and publish a multi-arch Docker image for openlist-ext to the GitHub
-# Container Registry (GHCR). Triggered by version tags (v*). The image bundles
-# the openlist-ext binary and a built OpenList-Frontend for linux/amd64 and
-# linux/arm64.
+# Container Registry (GHCR). Triggered by pushes to main (which refresh the
+# :latest image) and version tags (v*, which also publish :<version>). The
+# image bundles the openlist-ext binary and a built OpenList-Frontend for
+# linux/amd64 and linux/arm64.
 #
 # Each platform is built on a NATIVE runner (ubuntu-24.04 for amd64,
 # ubuntu-24.04-arm for arm64) instead of QEMU emulation, which avoids the
@@ -12,6 +13,8 @@ name: Publish Image
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
@@ -26,6 +29,13 @@ permissions:
   contents: write
   packages: write
 
+# Serialize runs per ref. Without this, an older main push finishing after a
+# newer one would overwrite :latest with a stale image. Per-ref grouping means
+# main pushes only cancel other in-flight main builds, never a tag release.
+concurrency:
+  group: publish-image-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   # Image name is derived from the repo owner/name, lowercased.
@@ -39,14 +49,15 @@ jobs:
       ref: ${{ steps.ref.outputs.ref }}
       is_version_tag: ${{ steps.ref.outputs.is_version_tag }}
       version_tag: ${{ steps.ref.outputs.version_tag }}
+      is_main: ${{ steps.ref.outputs.is_main }}
     steps:
       - name: Resolve or create build ref
         id: ref
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # For tag pushes, github.ref is already refs/tags/v* and exists.
-          # For workflow_dispatch, prefer the supplied ref input and fall back
+          # For tag/branch pushes, github.ref already exists. For
+          # workflow_dispatch, prefer the supplied ref input and fall back
           # to the default branch. If the ref names a version tag (v*) that
           # doesn't exist yet, auto-create it at the default branch HEAD so a
           # release can be cut by simply dispatching with the desired tag,
@@ -72,6 +83,11 @@ jobs:
             if [[ "$name" == v* ]]; then
               echo "is_version_tag=true" >> "$GITHUB_OUTPUT"
               echo "version_tag=${name}" >> "$GITHUB_OUTPUT"
+            fi
+            # Builds of main refresh the :latest image; every other branch
+            # (e.g. a feature branch via workflow_dispatch) does not.
+            if [ "$name" = "main" ]; then
+              echo "is_main=true" >> "$GITHUB_OUTPUT"
             fi
           elif [[ "$name" == v* ]]; then
             echo "is_version_tag=true" >> "$GITHUB_OUTPUT"
@@ -180,7 +196,11 @@ jobs:
         run: |
           repo="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           tags="${repo}:sha-${GITHUB_SHA::7}"
-          if [[ "${{ github.ref }}" == refs/tags/v* ]] || [[ "${{ needs.prepare.outputs.is_version_tag }}" == "true" ]]; then
+          # :latest tracks main and version-tag releases. Decided by the
+          # RESOLVED ref (prepare outputs), not github.ref, so a
+          # workflow_dispatch building some other branch never hijacks :latest.
+          if [[ "${{ needs.prepare.outputs.is_main }}" == "true" ]] \
+             || [[ "${{ needs.prepare.outputs.is_version_tag }}" == "true" ]]; then
             tags="${tags},${repo}:latest"
           fi
           if [[ "${{ needs.prepare.outputs.is_version_tag }}" == "true" ]]; then

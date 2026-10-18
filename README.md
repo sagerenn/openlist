@@ -130,8 +130,9 @@ mount a host directory (`-v /host/path:/data`), it must be writable by that
 user — e.g. `chown -R 100:101 /host/path` — or run with
 `--user $(id -u):$(id -g)` to match the directory's owner.
 
-The publish workflow (below) automates the multi-arch build + push to GHCR on
-version tags.
+The publish workflow (below) automates the multi-arch build + push to GHCR.
+It runs on pushes to main (refreshing `:latest`) and on version tags (which
+also publish `:<version>`).
 
 ### Configuration
 
