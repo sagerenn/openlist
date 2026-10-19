@@ -180,6 +180,36 @@ func (c *Client) UploadFile(ctx context.Context, fullPath string, r io.Reader, s
 	return nil
 }
 
+// FileInfo is the subset of /api/fs/get's response the extension uses when
+// building download links for uploaded files.
+type FileInfo struct {
+	Name   string `json:"name"`
+	Size   int64  `json:"size"`
+	IsDir  bool   `json:"is_dir"`
+	Sign   string `json:"sign"`
+	RawURL string `json:"raw_url"`
+}
+
+// GetFile fetches a file's metadata via POST /api/fs/get. The Sign field is
+// what OpenList expects as the "sign" query parameter on /d/* download
+// links when the path requires one (sign-all, storage sign, or a password-
+// protected meta); it is empty when no sign is needed. Sign is computed
+// purely from the path and settings, so fetching it as the admin yields the
+// same value any user would get.
+func (c *Client) GetFile(ctx context.Context, fullPath string) (FileInfo, error) {
+	fullPath = "/" + strings.TrimPrefix(fullPath, "/")
+	payload, _ := json.Marshal(map[string]string{"path": fullPath})
+	out, err := c.do(ctx, http.MethodPost, "/api/fs/get", bytes.NewReader(payload), "application/json")
+	if err != nil {
+		return FileInfo{}, err
+	}
+	var info FileInfo
+	if err := json.Unmarshal(out.Data, &info); err != nil {
+		return FileInfo{}, fmt.Errorf("openlist: decode fs/get data: %w", err)
+	}
+	return info, nil
+}
+
 // Ping checks that OpenList is reachable and the token is valid by hitting
 // /api/me (admin current user). Returns nil on success.
 func (c *Client) Ping(ctx context.Context) error {

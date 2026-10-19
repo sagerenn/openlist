@@ -80,6 +80,47 @@ OpenList may change its internals freely; as long as `server.Init(e)` and
 6. **Forward compatibility** — separate module + DB, public-packages-only
    dependency (see above).
 
+## curl upload
+
+One command to upload and share a file:
+
+```bash
+curl -T file.txt -H "X-Api-Key: <secret>" http://localhost:5245/upload/dir/file.txt
+```
+
+```json
+{"code":200,"message":"success","data":{
+  "path":"/dir/file.txt",
+  "url":"http://localhost:5245/d/dir/file.txt?sign=<sign>",
+  "sign":"<sign>","size":1234}}
+```
+
+`PUT /upload/<path>` (curl `-T` / `--upload-file`) and `POST /upload/<path>`
+(`--data-binary @file`) both work. The body is streamed to the storage
+never buffered, and the response's `url` is a same-origin `/d/<path>` link
+that works in a browser or `curl` — with the sign OpenList requires already
+embedded as `?sign=` when signed downloads are enabled (sign-all, storage
+sign, or a password-protected meta). The link is built from the request's
+own host, honoring `X-Forwarded-Proto` / `X-Forwarded-Host` behind a proxy.
+
+**Authentication** (guests are rejected): an API key with the `fs.put` scope
+(`X-Api-Key: <secret>` or `Authorization: Bearer <secret>`), or the static
+admin token (`Authorization: <admin-token>`). API-key uploads are attributed
+to the key's user, so the user's other features apply:
+
+- `X-LB-Group: g1` (or `?lb_group=g1`) — route through one of the user's LB
+  groups (see feature 4); the path is rewritten to the chosen member's
+  mount, the file name preserved, and `data.path` / `data.url` reflect the
+  final location. Not available with the admin token (no owning user).
+- A TTL record is created when the user has TTL enabled (feature 2), and
+  `X-Ttl: <seconds>` sets a per-file override, exactly as with
+  `/api/fs/put`.
+- OpenList's own write-permission checks still run server-side.
+
+Errors: `400` missing path / bad LB usage, `401` missing or invalid key,
+`403` key without `fs.put`, `404` unknown LB group, `502` storage failure,
+`503` LB group has no members.
+
 ## Build & run
 
 ```bash

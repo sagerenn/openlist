@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path"
 	"sync"
 )
 
@@ -106,10 +107,33 @@ func NewStubOpenList(token string) *StubOpenList {
 		writeJSON(w, 200, "success", ginH{"content": []interface{}{}, "total": 0})
 	})
 	mux.HandleFunc("/api/fs/get", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.Path == "" {
+			req.Path = r.URL.Query().Get("path")
+		}
 		s.mu.Lock()
-		s.Gets = append(s.Gets, r.URL.Path)
+		s.Gets = append(s.Gets, req.Path)
+		// Size of the most recent upload at this path, if any, so callers
+		// see the authoritative stored size.
+		size := int64(0)
+		for _, u := range s.Uploads {
+			if u.Path == req.Path {
+				size = int64(len(u.Body))
+			}
+		}
 		s.mu.Unlock()
-		writeJSON(w, 200, "success", ginH{"name": "file"})
+		writeJSON(w, 200, "success", ginH{
+			"name": path.Base(req.Path),
+			"size": size,
+			// Echo a deterministic sign so tests can assert it is
+			// propagated into download links. OpenList computes the sign
+			// from the path; ours is just "sign:<path>".
+			"sign": "sign:" + req.Path,
+		})
 	})
 
 	s.Server = httptest.NewServer(mux)

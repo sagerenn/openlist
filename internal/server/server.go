@@ -132,6 +132,16 @@ func (s *Server) Engine(mountOpenList bool) *gin.Engine {
 	admin := r.Group("/ext/admin", s.adminAuth())
 	s.registerAdminRoutes(admin)
 
+	// curl-friendly streaming upload + download link (PUT/POST /upload/<path>).
+	// It is NOT under /ext/ so it stays outside the admin guard; it performs
+	// its own API-key/admin-token auth. It is also not a file-op path, so the
+	// feature middleware passes it straight through to this handler.
+	upload := s.curlUpload
+	r.PUT("/upload", upload)
+	r.PUT("/upload/*path", upload)
+	r.POST("/upload", upload)
+	r.POST("/upload/*path", upload)
+
 	return r
 }
 
