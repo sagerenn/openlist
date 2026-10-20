@@ -350,6 +350,65 @@ func TestE2E_LoadBalanceUpload(t *testing.T) {
 	}
 }
 
+// TestE2E_LoadBalanceListGroups covers the admin list endpoints the manage
+// UI's Load Balance page calls after creating a group: GET /ext/admin/lb/group
+// takes user_id as a QUERY parameter (per the README and the frontend), while
+// the per-group detail GET /ext/admin/lb/group/:id is path-based. Regression
+// test: listLBGroups used to read c.Param("user_id") — always empty on this
+// route — so every list call 400'd and the group created in the UI never
+// appeared in the table.
+func TestE2E_LoadBalanceListGroups(t *testing.T) {
+	extURL, _, cleanup := setupE2E(t)
+	defer cleanup()
+
+	// Create a group for user 41 with one member, as the UI would.
+	resp := adminDo(t, "POST", extURL+"/ext/admin/lb/group", `{"name":"g41","user_id":41,"strategy":"least_used","path_prefix":"/uploads"}`)
+	require.Equal(t, 200, resp.StatusCode)
+	created := respBody(t, resp)
+	groupID := uint64(created["data"].(map[string]interface{})["id"].(float64))
+	resp = adminDo(t, "POST", extURL+"/ext/admin/lb/group/"+itoa(groupID)+"/member", `{"mount_path":"/infini","weight":2}`)
+	require.Equal(t, 200, resp.StatusCode)
+	respBody(t, resp)
+
+	// List via the query-parameter form the frontend uses. This is the call
+	// that used to 400.
+	resp = adminDo(t, "GET", extURL+"/ext/admin/lb/group?user_id=41", "")
+	require.Equal(t, 200, resp.StatusCode, "list must accept ?user_id= (frontend contract)")
+	m := respBody(t, resp)
+	list, ok := m["data"].([]interface{})
+	require.True(t, ok, "data should be an array, got: %v", m["data"])
+	require.Len(t, list, 1)
+	g := list[0].(map[string]interface{})
+	assert.Equal(t, "g41", g["name"])
+	assert.Equal(t, float64(41), g["user_id"])
+	assert.Equal(t, "least_used", g["strategy"])
+	assert.Equal(t, "/uploads", g["path_prefix"])
+
+	// Another user's list is empty, not an error.
+	resp = adminDo(t, "GET", extURL+"/ext/admin/lb/group?user_id=42", "")
+	require.Equal(t, 200, resp.StatusCode)
+	m = respBody(t, resp)
+	assert.Empty(t, m["data"])
+
+	// Missing user_id is a 400, not a panic.
+	resp = adminDo(t, "GET", extURL+"/ext/admin/lb/group", "")
+	require.Equal(t, 400, resp.StatusCode)
+	respBody(t, resp)
+
+	// The Members button's detail call returns group + members.
+	resp = adminDo(t, "GET", extURL+"/ext/admin/lb/group/"+itoa(groupID), "")
+	require.Equal(t, 200, resp.StatusCode)
+	d := respBody(t, resp)
+	detail := d["data"].(map[string]interface{})
+	assert.Equal(t, "g41", detail["group"].(map[string]interface{})["name"])
+	members, ok := detail["members"].([]interface{})
+	require.True(t, ok, "members should be an array, got: %v", detail["members"])
+	require.Len(t, members, 1)
+	mm := members[0].(map[string]interface{})
+	assert.Equal(t, "/infini", mm["mount_path"])
+	assert.Equal(t, float64(2), mm["weight"])
+}
+
 // ---- Feature 5: API key auth ----
 
 func TestE2E_APIKeyAuthAndScope(t *testing.T) {

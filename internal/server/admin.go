@@ -52,6 +52,21 @@ func userIDParam(c *gin.Context) (uint, bool) {
 	return uint(id), true
 }
 
+// userIDQuery is userIDParam for the query-string form (?user_id=N). The LB
+// group list is the one endpoint documented and called
+// that way (GET /ext/admin/lb/group?user_id=10, per the README and the
+// frontend's manage UI): its route has no :user_id path segment, so reading
+// c.Param there always fails and the UI's group table stays empty even
+// after a successful create.
+func userIDQuery(c *gin.Context) (uint, bool) {
+	id, err := strconv.ParseUint(c.Query("user_id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid user_id"})
+		return 0, false
+	}
+	return uint(id), true
+}
+
 // ---- domain handlers ----
 
 type setDomainReq struct {
@@ -239,7 +254,7 @@ func addLBMember(c *gin.Context) {
 }
 
 func listLBGroups(c *gin.Context) {
-	uid, ok := userIDParam(c)
+	uid, ok := userIDQuery(c)
 	if !ok {
 		return
 	}
