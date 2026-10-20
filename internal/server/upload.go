@@ -53,7 +53,10 @@ import (
 // When OpenList requires signed downloads (sign-all, storage sign, or a
 // password-protected meta), the sign is fetched via /api/fs/get — it is
 // derived from the path alone, so the admin-fetched value equals what any
-// user would receive — and embedded as ?sign=.
+// user would receive — and embedded as ?sign=. For a load-balanced upload
+// (header or path activation) the data additionally carries target_mount
+// and source_path: the link points at the physical file, while source_path
+// is the logical path under the group prefix that reads route back through.
 func (s *Server) curlUpload(c *gin.Context) {
 	// Resolve the identity: API key first, then the static admin token.
 	var (
@@ -196,12 +199,23 @@ func (s *Server) curlUpload(c *gin.Context) {
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": gin.H{
+	// The response mirrors the non-LB fields (path/url/sign/size — all on the
+	// physical target, so the link downloads the stored bytes) and, when the
+	// upload was load-balanced, the LB fields the /api/fs/put form returns:
+	// the member it landed on and the logical source path the caller
+	// addressed (under the group prefix), so a one-command curl flow knows
+	// both where the bytes are and which path to read them back through.
+	data := gin.H{
 		"path": targetPath,
 		"url":  s.downloadURL(c, targetPath, sign),
 		"sign": sign,
 		"size": size,
-	}})
+	}
+	if lbGroup != nil {
+		data["target_mount"] = lbMember.MountPath
+		data["source_path"] = origPath
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": data})
 }
 
 // downloadURL builds the /d/<path> link served by this engine, mirroring

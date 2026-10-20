@@ -234,6 +234,68 @@ func TestE2E_CurlUploadLBGroup(t *testing.T) {
 	assert.Equal(t, 400, code)
 }
 
+// TestE2E_CurlUploadLBByPath covers the one-command flow under path
+// activation, no X-LB-Group header: curl -T under a group's path_prefix
+// must be routed through the group, land on a member, return a download
+// link for the physical file, AND record the upload so the logical path
+// reads back through the group afterwards.
+func TestE2E_CurlUploadLBByPath(t *testing.T) {
+	extURL, stub, cleanup := setupE2E(t)
+	defer cleanup()
+
+	// Group with prefix /pshare and members /s3 + /oss for user 69.
+	secret, _ := lbPathSetup(t, extURL, 69)
+
+	code, m := doUpload(t, "PUT", extURL, "/pshare/2026/plan.txt", "Bearer "+secret, "plan-bytes", nil)
+	require.Equal(t, 200, code, "path-activated curl upload should succeed: %v", m)
+	d := uploadData(t, m)
+
+	// Routed through the group: the target is the member's mount with the
+	// prefix replaced, and the response names both sides of the mapping.
+	mount, _ := d["target_mount"].(string)
+	assert.Contains(t, []string{"/s3", "/oss"}, mount, "must land on a group member: %v", d)
+	assert.Equal(t, mount+"/2026/plan.txt", d["path"], "path must be the physical target")
+	assert.Equal(t, "/pshare/2026/plan.txt", d["source_path"], "source_path must be the logical path under the prefix")
+
+	// The stream went to the physical path.
+	uploads := stub.SnapshotUploads()
+	require.Len(t, uploads, 1)
+	assert.Equal(t, mount+"/2026/plan.txt", uploads[0].Path)
+	assert.Equal(t, "plan-bytes", uploads[0].Body)
+
+	// The download link is GETable and serves the stored bytes (sign and
+	// all; the stub's /d/ answers file-bytes:<path>).
+	link := strings.Replace(d["url"].(string), hostOf(t, extURL), extURL, 1)
+	resp, err := http.Get(link)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, 200, resp.StatusCode, "download link must be GETable: %s", link)
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.True(t, strings.HasPrefix(string(b), "file-bytes:"), "GET on the returned link should serve the file, got: %s", string(b))
+
+	// The upload was recorded (admin uploads view / read routing pin).
+	respA := adminDo(t, "GET", extURL+"/ext/admin/lb/uploads?user_id=69", "")
+	require.Equal(t, 200, respA.StatusCode)
+	recs := respBody(t, respA)["data"].([]interface{})
+	require.Len(t, recs, 1)
+	rec := recs[0].(map[string]interface{})
+	assert.Equal(t, "/pshare/2026/plan.txt", rec["source_path"])
+	assert.Equal(t, mount, rec["target_mount"])
+	assert.Equal(t, mount+"/2026/plan.txt", rec["target_path"])
+
+	// Reading the file back through the LOGICAL path routes to the member
+	// that holds it — the full upload-and-share loop in one prefix. The stub
+	// records every GET, and this test already made two (the response's sign
+	// lookup on the physical path, and the download-link GET on /d/...), so
+	// assert on the LAST get: the logical read rewritten to the physical file.
+	lbCode, _ := lbFsPost(t, extURL, secret, "get", `{"path":"/pshare/2026/plan.txt"}`)
+	assert.Equal(t, 200, lbCode)
+	gets := stub.SnapshotGets()
+	require.NotEmpty(t, gets)
+	assert.Equal(t, mount+"/2026/plan.txt", gets[len(gets)-1])
+}
+
 func TestE2E_CurlUploadPOSTForm(t *testing.T) {
 	extURL, stub, cleanup := setupE2E(t)
 	defer cleanup()

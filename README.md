@@ -117,7 +117,11 @@ to the key's user, so the user's other features apply:
   mount, the file name preserved, and `data.path` / `data.url` reflect the
   final location. Not available with the admin token (no owning user).
   A target path under a group's `path_prefix` is routed the same way with
-  no header (path activation).
+  no header (path activation). In both LB forms the response additionally
+  carries `target_mount` (the member that took the file) and `source_path`
+  (the logical path under the prefix that reads route back through); the
+  `url` always points at the member's physical copy, so it downloads
+  directly.
 - A TTL record is created when the user has TTL enabled (feature 2), and
   `X-Ttl: <seconds>` sets a per-file override, exactly as with
   `/api/fs/put`.
@@ -346,7 +350,11 @@ deployments, e.g. `/files/ext/admin`) and require the `Authorization:
   The prefix is replaced by the chosen member's mount path and everything
   below it is preserved (`/pshare/sub/dir/name.txt` on mount `/infini`
   lands at `/infini/sub/dir/name.txt`). `PUT/POST /upload/pshare/...` is
-  routed the same way. The header wins when both apply; an empty prefix
+  routed the same way — one command shares a load-balanced file:
+  `curl -T file.txt -H "X-Api-Key: <secret>" http://host:5245/upload/pshare/dir/file.txt`
+  returns the usual download `url` (pointing at the member's physical copy)
+  plus `target_mount` and `source_path` (the logical prefix path later reads
+  route through). The header wins when both apply; an empty prefix
   never activates by path. Longest prefix wins when prefixes nest.
 
 **Reads and removes under the prefix** are routed too, which is what makes
