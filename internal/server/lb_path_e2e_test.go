@@ -164,21 +164,24 @@ func TestE2E_LBPathActivationReadRemove(t *testing.T) {
 	assert.Equal(t, mountB+"/two.txt", gets[1])
 
 	// A get with no record (never uploaded) falls back to strategy routing.
-	// Every pick advances the in-memory rr counter (only the persisted
-	// upload_count is left alone by reads), so the next pick is mountA.
+	// Reads PEEK at the round-robin position without consuming it (reads
+	// must not distort the upload balancing), so after the two uploads the
+	// fallback resolves to the member that would serve the NEXT upload:
+	// mountA.
 	code, _ = lbFsPost(t, extURL, secret, "get", `{"path":"/pshare/never-uploaded.txt"}`)
 	assert.Equal(t, 200, code)
 	gets = stub.SnapshotGets()
 	require.Len(t, gets, 3)
 	assert.Equal(t, mountA+"/never-uploaded.txt", gets[2])
 
-	// fs/list of the prefix root is also rewritten (strategy pick: mountB,
-	// next in the alternation), to the bare mount — not the prefix.
+	// fs/list of the prefix root is also rewritten, to the bare mount — not
+	// the prefix. Another record-less read: it peeks at the same
+	// unconsumed position, so it resolves to mountA again.
 	code, _ = lbFsPost(t, extURL, secret, "list", `{"path":"/pshare"}`)
 	assert.Equal(t, 200, code)
 	lists := stub.SnapshotLists()
 	require.Len(t, lists, 1)
-	assert.Equal(t, mountB, lists[0])
+	assert.Equal(t, mountA, lists[0])
 
 	// fs/remove of the files: the body's dir is rewritten to the physical
 	// parent, and the records are purged after success.
@@ -280,4 +283,53 @@ func TestE2E_LBUploadRecordsTTL(t *testing.T) {
 	assert.Equal(t, targetMount, removes[0].Dir)
 	name := targetPath[strings.LastIndex(targetPath, "/")+1:]
 	assert.Equal(t, []string{name}, removes[0].Names)
+}
+
+// TestE2E_CORSOnFeatureChainResponses pins the regression where a
+// cross-origin browser upload (the static pshare site) succeeded at the
+// server but the browser refused to hand the response to the page: the
+// feature chain short-circuits before OpenList's engine-level cors
+// middleware, so responses it writes itself shipped without
+// Access-Control-Allow-Origin and fetch threw — surfacing in the frontend
+// as "could not reach OpenList". Every governed response must carry the
+// header: the LB-path upload success AND the guard denials, so a browser
+// client sees the real error instead of an opaque network failure.
+func TestE2E_CORSOnFeatureChainResponses(t *testing.T) {
+	extURL, _, cleanup := setupE2E(t)
+	defer cleanup()
+
+	secret, _ := lbPathSetup(t, extURL, 55)
+
+	origin := map[string]string{"Origin": "https://sagerenn.github.io"}
+
+	// LB-path upload (handled entirely by the extension's lbUpload): the
+	// 200 must be readable cross-origin.
+	req, err := http.NewRequest("PUT", extURL+"/api/fs/put", bytes.NewReader([]byte("payload")))
+	require.NoError(t, err)
+	req.Header.Set("X-Api-Key", secret)
+	req.Header.Set("File-Path", "/pshare/cors/note.txt")
+	req.Header.Set("Origin", origin["Origin"])
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, 200, resp.StatusCode, "body: %s", string(b))
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"),
+		"LB upload response must be readable by the cross-origin frontend")
+
+	// Guard denial written by apiKeyAuth: same requirement.
+	req, err = http.NewRequest("PUT", extURL+"/api/fs/put", bytes.NewReader([]byte("payload")))
+	require.NoError(t, err)
+	req.Header.Set("X-Api-Key", "not-a-real-key")
+	req.Header.Set("File-Path", "/pshare/cors/note.txt")
+	req.Header.Set("Origin", origin["Origin"])
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, 401, resp.StatusCode)
+	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"),
+		"guard denials must be readable by the cross-origin frontend")
 }

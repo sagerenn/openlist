@@ -339,15 +339,22 @@ func TestE2E_LoadBalanceUpload(t *testing.T) {
 	for _, u := range uploads {
 		paths = append(paths, u.Path)
 	}
-	// Expect alternating mount prefixes.
-	assert.Contains(t, paths[0], "/s3/")
-	assert.Contains(t, paths[1], "/oss/")
-	assert.Contains(t, paths[2], "/s3/")
-	assert.Contains(t, paths[3], "/oss/")
+	// Expect alternating mount prefixes. Which member is "first" is not
+	// stable (the rr counter carries across tests), so assert the
+	// alternation pattern, not specific mounts.
+	assert.Equal(t, mountOf(paths[0]), mountOf(paths[2]), "picks 1 and 3 must land on the same member")
+	assert.Equal(t, mountOf(paths[1]), mountOf(paths[3]), "picks 2 and 4 must land on the same member")
+	assert.NotEqual(t, mountOf(paths[0]), mountOf(paths[1]), "equal-weight round robin must alternate")
 	// Original filename preserved.
 	for _, u := range uploads {
 		assert.True(t, strings.HasSuffix(u.Path, ".txt"), "filename preserved: %s", u.Path)
 	}
+}
+
+// mountOf returns the mount-path prefix of a physical upload path, e.g.
+// "/s3/2024/a.txt" -> "/s3".
+func mountOf(p string) string {
+	return "/" + strings.SplitN(strings.TrimPrefix(p, "/"), "/", 2)[0]
 }
 
 // TestE2E_LoadBalanceListGroups covers the admin list endpoints the manage

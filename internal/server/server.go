@@ -339,6 +339,21 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 			c.Next()
 			return
 		}
+		// Cross-origin access for the governed paths: this extension exists
+		// to serve browser frontends hosted on other origins (the static
+		// pshare site) with bearer API keys, but responses the feature
+		// chain writes itself — LB-path upload results, guard denials —
+		// never reach OpenList's engine-level cors middleware, which is
+		// registered later in the chain (inside olInit). A cross-origin
+		// upload would succeed at the server yet be unreadable by the page:
+		// fetch rejects on the missing Access-Control-Allow-Origin and the
+		// frontend reports a network failure (the OPTIONS preflight passes
+		// through to OpenList's cors, which is why only the real response's
+		// header goes missing). Set it here so every governed response
+		// carries it — including pass-through requests, on which OpenList's
+		// own cors middleware then re-Sets the header per its configured
+		// policy, so its configured value still governs there.
+		c.Header("Access-Control-Allow-Origin", "*")
 		apiKey(c)
 		if c.IsAborted() {
 			return

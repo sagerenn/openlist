@@ -154,7 +154,7 @@ func Select(g Group) (GroupMember, error) {
 		return GroupMember{}, ErrNoMembers
 	}
 
-	idx, err := pickIndex(g, members)
+	idx, err := pickIndex(g, members, true)
 	if err != nil {
 		return GroupMember{}, err
 	}
@@ -170,7 +170,10 @@ func Select(g Group) (GroupMember, error) {
 }
 
 // pickIndex returns the index into members chosen by the group's strategy.
-func pickIndex(g Group, members []GroupMember) (int, error) {
+// advance=false peeks at the current position without moving it, so reads
+// routed under a group prefix do not distort the upload balancing the
+// strategies track.
+func pickIndex(g Group, members []GroupMember, advance bool) (int, error) {
 	switch g.Strategy {
 	case StrategyLeastUsed:
 		best := 0
@@ -183,15 +186,17 @@ func pickIndex(g Group, members []GroupMember) (int, error) {
 	case StrategyRandom:
 		return weightedRandom(members), nil
 	case StrategyRoundRobin:
-		return roundRobin(g.ID, members), nil
+		return roundRobin(g.ID, members, advance), nil
 	default:
-		return roundRobin(g.ID, members), nil
+		return roundRobin(g.ID, members, advance), nil
 	}
 }
 
 // roundRobin returns the next index in a weighted round-robin sequence.
-// Weight is honored by repeating a member's slot Weight times.
-func roundRobin(groupID uint64, members []GroupMember) int {
+// Weight is honored by repeating a member's slot Weight times. With
+// advance=false it reports the position the NEXT advance would pick,
+// without consuming it.
+func roundRobin(groupID uint64, members []GroupMember, advance bool) int {
 	rrMu.Lock()
 	defer rrMu.Unlock()
 	slots := 0
@@ -211,7 +216,12 @@ func roundRobin(groupID uint64, members []GroupMember) int {
 		ptr = &z
 		rrCtr[groupID] = ptr
 	}
-	pos := int(atomic.AddUint64(ptr, 1)-1) % slots
+	var pos int
+	if advance {
+		pos = int(atomic.AddUint64(ptr, 1)-1) % slots
+	} else {
+		pos = int(atomic.LoadUint64(ptr)) % slots
+	}
 	for i, m := range members {
 		w := m.Weight
 		if w <= 0 {
@@ -340,7 +350,7 @@ func PickForRead(g Group) (GroupMember, error) {
 	if len(members) == 0 {
 		return GroupMember{}, ErrNoMembers
 	}
-	idx, err := pickIndex(g, members)
+	idx, err := pickIndex(g, members, false)
 	if err != nil {
 		return GroupMember{}, err
 	}

@@ -207,21 +207,28 @@ func TestE2E_CurlUploadLBGroup(t *testing.T) {
 	ck, err := apikey.Create(65, "curl", []apikey.Scope{apikey.ScopeWrite})
 	require.NoError(t, err)
 
-	// Two uploads with X-LB-Group should alternate backends.
+	// Two uploads with X-LB-Group should alternate backends. Which member
+	// is "first" is not stable — the rr counter carries across tests (group
+	// IDs restart per test DB) — so assert alternation against the mounts
+	// the responses report, not fixed ones.
+	mounts := make([]string, 2)
 	for i := 0; i < 2; i++ {
 		code, m := doUpload(t, "PUT", extURL, "/orig/f"+itoa(uint64(i))+".txt", "Bearer "+ck.Secret, "p", map[string]string{"X-LB-Group": "g65"})
 		require.Equal(t, 200, code, "lb upload %d should succeed", i)
 		d := uploadData(t, m)
 		// path + url reflect the rewritten target, and the name is preserved.
-		wantDir := []string{"/s3", "/oss"}[i]
-		assert.Equal(t, wantDir+"/f"+itoa(uint64(i))+".txt", d["path"])
-		assert.Contains(t, d["url"], "/d"+wantDir+"/f")
+		name := "/f" + itoa(uint64(i)) + ".txt"
+		p, _ := d["path"].(string)
+		require.True(t, strings.HasSuffix(p, name), "path %q must preserve the file name", p)
+		mounts[i] = strings.TrimSuffix(p, name)
+		assert.Contains(t, d["url"], "/d"+mounts[i]+"/f")
 	}
+	assert.NotEqual(t, mounts[0], mounts[1], "equal-weight round robin must alternate")
 
 	uploads := stub.SnapshotUploads()
 	require.Len(t, uploads, 2)
-	assert.Equal(t, "/s3/f0.txt", uploads[0].Path)
-	assert.Equal(t, "/oss/f1.txt", uploads[1].Path)
+	assert.Equal(t, mounts[0]+"/f0.txt", uploads[0].Path)
+	assert.Equal(t, mounts[1]+"/f1.txt", uploads[1].Path)
 
 	// LB group owned by another user is invisible.
 	ckOther, err := apikey.Create(66, "curl", []apikey.Scope{apikey.ScopeWrite})
