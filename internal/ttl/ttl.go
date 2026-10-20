@@ -192,6 +192,19 @@ func Expired(now time.Time, limit int) ([]FileTTLRecord, error) {
 	return recs, err
 }
 
+// Record returns the TTL record for path, or nil when none exists.
+func Record(path string) (*FileTTLRecord, error) {
+	var rec FileTTLRecord
+	err := db.DB().Where("path = ?", path).Take(&rec).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
 // HasRecord reports whether a TTL record exists for path.
 func HasRecord(path string) (bool, error) {
 	var rec FileTTLRecord

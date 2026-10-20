@@ -5,17 +5,24 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sagerenn/openlist/internal/apikey"
 	"github.com/sagerenn/openlist/internal/config"
+	"github.com/sagerenn/openlist/internal/db"
 	"github.com/sagerenn/openlist/internal/domain"
+	"github.com/sagerenn/openlist/internal/lb"
 	"github.com/sagerenn/openlist/internal/listperm"
 	"github.com/sagerenn/openlist/internal/testutil"
+	"github.com/sagerenn/openlist/internal/ttl"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -64,6 +71,44 @@ func TestNormalizeBasePath(t *testing.T) {
 }
 
 // ---- construction: loopback client target ----
+
+// TestSubpath_BasePathCollisionRefused pins the guard against base paths
+// that ARE a top-level route segment: behind a prefix-stripping proxy the
+// stripped form of such a route (e.g. /d/file.txt with base /d) already
+// starts with the base, so the wrapper cannot tell it from a
+// pass-through-form request and the engine 404s it. Any base whose first
+// segment is not a route segment is fine, however deep.
+func TestSubpath_BasePathCollisionRefused(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+
+	for _, bad := range []string{
+		"/d", "/api", "/ext", "/upload", "/sd", "/i", "/dav", "/ping",
+		// Full-URL form: the collision is in the path component.
+		"https://example.com/api",
+		// Deeper paths are equally ambiguous when they start with a route
+		// segment: a download of the logical file "/x/y" under base /d/x is
+		// /d/x/d/x/y, whose stripped form /d/x/y starts with the base.
+		"/d/more",
+	} {
+		cfg := config.Default()
+		cfg.AdminToken = "tok"
+		cfg.SiteURL = bad
+		_, err := New(cfg)
+		require.Error(t, err, "New must refuse base path %q", bad)
+		assert.Contains(t, err.Error(), "collides", "error for base %q", bad)
+	}
+	for _, ok := range []string{
+		"", "/", "/files", "/files/d", "/my-site", "/files/upload",
+		"https://example.com/files",
+	} {
+		cfg := config.Default()
+		cfg.AdminToken = "tok"
+		cfg.SiteURL = ok
+		_, err := New(cfg)
+		require.NoError(t, err, "New must accept base path %q", ok)
+	}
+}
 
 func TestSubpath_LoopbackClientIncludesPrefix(t *testing.T) {
 	dbCleanup := testutil.SetupDB(t)
@@ -268,9 +313,10 @@ func TestSubpath_RootUnchanged(t *testing.T) {
 }
 
 // TestSubpath_DownloadRecordsAccess proves applyTTL's path extraction
-// (downloadPath) works with the prefix: a TTL record created for the
-// logical (un-prefixed) path is matched by a <base>/d/... download, so the
-// record survives and its access window slides.
+// works with the prefix and actually SLIDES the window: with TTL in
+// ModeAccess, a TTL record created (and backdated) for the logical
+// (un-prefixed) path is refreshed by a <base>/d/... download, moving both
+// LastAccess and ExpiresAt forward.
 func TestSubpath_DownloadRecordsAccess(t *testing.T) {
 	extURL, _, cleanup := setupE2EBase(t, "/files")
 	defer cleanup()
@@ -278,16 +324,23 @@ func TestSubpath_DownloadRecordsAccess(t *testing.T) {
 	ck, err := apikey.Create(73, "curl", []apikey.Scope{apikey.ScopeRead, apikey.ScopeWrite})
 	require.NoError(t, err)
 
-	// Upload with TTL enabled for user 73 (curlUpload records the TTL at
-	// the logical path).
-	ttlSetEnabled(73)
+	// ModeAccess: the whole point is that a download slides ExpiresAt.
+	require.NoError(t, ttl.SetConfig(ttl.UserTTLConfig{
+		UserID: 73, Enabled: true, Mode: ttl.ModeAccess, Duration: 3600,
+	}))
 	code, m := doUpload(t, "PUT", extURL, "/ttlfile.txt", "Bearer "+ck.Secret, "ttl", nil)
 	require.Equal(t, 200, code, "upload should succeed: %v", m)
 	uploadData(t, m)
 
-	ok, err := ttlHasRecord("/ttlfile.txt")
+	rec, err := ttl.Record("/ttlfile.txt")
 	require.NoError(t, err)
-	assert.True(t, ok, "TTL record created for the logical path (no base path)")
+	require.NotNil(t, rec, "TTL record created for the logical path (no base path)")
+
+	// Backdate the record two hours so a slide is unmistakable.
+	backdated := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, db.DB().Model(&ttl.FileTTLRecord{}).
+		Where("path = ?", "/ttlfile.txt").
+		Updates(map[string]interface{}{"last_access": backdated, "expires_at": backdated}).Error)
 
 	// A download through the subpath serves the file and refreshes the
 	// record (RecordAccess is keyed by the extracted logical path).
@@ -298,9 +351,132 @@ func TestSubpath_DownloadRecordsAccess(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, "file-bytes:/d/ttlfile.txt", string(b))
 
-	ok, err = ttlHasRecord("/ttlfile.txt")
+	rec, err = ttl.Record("/ttlfile.txt")
 	require.NoError(t, err)
-	assert.True(t, ok, "TTL record survives the subpath download")
+	require.NotNil(t, rec, "TTL record survives the subpath download")
+	assert.True(t, rec.LastAccess.After(backdated.Add(time.Hour)),
+		"LastAccess must slide on download: got %v, backdated %v", rec.LastAccess, backdated)
+	assert.True(t, rec.ExpiresAt.After(backdated.Add(time.Hour)),
+		"ModeAccess ExpiresAt must slide on download: got %v, backdated %v", rec.ExpiresAt, backdated)
+}
+
+// TestSubpath_ShareDownloadRecordsAccess proves share downloads (/sd) also
+// refresh the TTL window — at the file's LOGICAL path. The share URL
+// carries a share id where other download routes carry the path, so the
+// guard resolves the id through the share API (as the admin, since share
+// links are anonymous) and joins the share-relative remainder onto the
+// share's root(s) exactly like OpenList's own op.GetSharingUnwrapPath.
+func TestSubpath_ShareDownloadRecordsAccess(t *testing.T) {
+	extURL, stub, cleanup := setupE2EBase(t, "/files")
+	defer cleanup()
+
+	ck, err := apikey.Create(76, "curl", []apikey.Scope{apikey.ScopeRead, apikey.ScopeWrite})
+	require.NoError(t, err)
+	require.NoError(t, ttl.SetConfig(ttl.UserTTLConfig{
+		UserID: 76, Enabled: true, Mode: ttl.ModeAccess, Duration: 3600,
+	}))
+
+	// Single-root share "sh9": /srv9/kept.txt is shared as /sd/sh9/kept.txt.
+	stub.SetShare("sh9", []string{"/srv9"})
+	code, m := doUpload(t, "PUT", extURL, "/srv9/kept.txt", "Bearer "+ck.Secret, "kept", nil)
+	require.Equal(t, 200, code, "upload should succeed: %v", m)
+	uploadData(t, m)
+
+	// Multi-root share "shM": two storages, roots /mntA/photos and
+	// /mntB/videos; the share's first segment names the root (by base
+	// name), as in OpenList's multi-file shares.
+	stub.SetShare("shM", []string{"/mntA/photos", "/mntB/videos"})
+	code, m = doUpload(t, "PUT", extURL, "/mntA/photos/pic.jpg", "Bearer "+ck.Secret, "pic", nil)
+	require.Equal(t, 200, code, "upload should succeed: %v", m)
+	uploadData(t, m)
+	// A second file under the same root, downloaded by nobody: its record
+	// staying backdated is the proof that an unresolvable share URL slides
+	// nothing.
+	code, m = doUpload(t, "PUT", extURL, "/mntA/photos/other.jpg", "Bearer "+ck.Secret, "other", nil)
+	require.Equal(t, 200, code, "upload should succeed: %v", m)
+	uploadData(t, m)
+
+	// Backdate all records so a slide is unmistakable.
+	backdated := time.Now().Add(-2 * time.Hour)
+	require.NoError(t, db.DB().Model(&ttl.FileTTLRecord{}).
+		Where("path IN ?", []string{"/srv9/kept.txt", "/mntA/photos/pic.jpg", "/mntA/photos/other.jpg"}).
+		Updates(map[string]interface{}{"last_access": backdated, "expires_at": backdated}).Error)
+
+	// --- single-root share download slides the window at the logical path.
+	resp, err := http.Get(extURL + "/files/sd/sh9/kept.txt")
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	assert.Equal(t, "share-bytes:/sd/sh9/kept.txt", string(b))
+
+	rec, err := ttl.Record("/srv9/kept.txt")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.True(t, rec.ExpiresAt.After(backdated.Add(time.Hour)),
+		"single-root share download must slide the TTL window at the resolved path: got %v", rec.ExpiresAt)
+
+	// --- multi-root share download maps the first share segment to the
+	// matching root (photos => /mntA/photos, by base name, like OpenList).
+	resp, err = http.Get(extURL + "/files/sd/shM/photos/pic.jpg")
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+	resp.Body.Close()
+
+	rec, err = ttl.Record("/mntA/photos/pic.jpg")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.True(t, rec.ExpiresAt.After(backdated.Add(time.Hour)),
+		"multi-root share download must slide the TTL window at the mapped path: got %v", rec.ExpiresAt)
+
+	// --- a share URL whose first segment matches no root resolves to
+	// nothing: the download still serves, and no record slides (the
+	// untouched other.jpg proves it — a slide would have moved it, since
+	// "nope" maps to no root at all).
+	resp, err = http.Get(extURL + "/files/sd/shM/nope/pic.jpg")
+	require.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode, "unresolvable share path must not break the download")
+	resp.Body.Close()
+	rec, err = ttl.Record("/mntA/photos/other.jpg")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.False(t, rec.ExpiresAt.After(backdated.Add(90*time.Minute)),
+		"a no-match share path must not refresh any record")
+
+	// --- an unknown share id likewise resolves to nothing.
+	resp, err = http.Get(extURL + "/files/sd/noshare/kept.txt")
+	require.NoError(t, err)
+	resp.Body.Close()
+	rec, err = ttl.Record("/srv9/kept.txt")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.True(t, rec.ExpiresAt.After(backdated.Add(time.Hour)),
+		"the earlier slide must persist (the unknown-share download must not touch the record)")
+}
+
+// TestUnwrapSharePath pins the share-root resolution against OpenList's
+// op.GetSharingUnwrapPath semantics: single root joins, multi root maps the
+// first share segment onto a root by base name (first match wins).
+func TestUnwrapSharePath(t *testing.T) {
+	cases := []struct {
+		roots []string
+		rel   string
+		want  string
+	}{
+		{[]string{"/srv"}, "/a.txt", "/srv/a.txt"},
+		{[]string{"/srv"}, "/", "/srv"},
+		{[]string{"/srv/nested"}, "/deep/a.txt", "/srv/nested/deep/a.txt"},
+		{[]string{"/mntA/photos", "/mntB/videos"}, "/photos/pic.jpg", "/mntA/photos/pic.jpg"},
+		{[]string{"/mntA/photos", "/mntB/videos"}, "/videos/x.mp4", "/mntB/videos/x.mp4"},
+		{[]string{"/mntA/photos", "/mntB/videos"}, "/docs/x", ""},
+		{[]string{"/mntA/photos", "/mntB/videos"}, "/", ""},
+		// Same base name on two roots: the first root in Files order wins.
+		{[]string{"/mntA/dup", "/mntB/dup"}, "/dup/a.txt", "/mntA/dup/a.txt"},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, unwrapSharePath(tc.roots, tc.rel),
+			"unwrapSharePath(%v, %q)", tc.roots, tc.rel)
+	}
 }
 
 // TestSubpath_EnsurePlaceholderDistWritesSiteURL verifies the config.json
@@ -325,6 +501,101 @@ func TestSubpath_EnsurePlaceholderDistWritesSiteURL(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(raw, &cfg))
 	assert.Equal(t, "", cfg["site_url"], "empty site URL must stay empty (request-derived links)")
+}
+
+// TestSubpath_SiteURLOwnership pins who owns OpenList's config.json
+// site_url. The extension pins its SITE_URL there on every boot, but must
+// not clobber a value it did not write: a pre-existing OpenList config, or
+// an operator's direct edit, is refused loudly (like the
+// OPENLIST_SITE_URL env guard) instead of being silently overwritten. The
+// sidecar marker (config.json cannot carry one — OpenList rewrites the file
+// from its struct each boot) distinguishes "we wrote this value" (SITE_URL
+// change wins) from "someone else did".
+func TestSubpath_SiteURLOwnership(t *testing.T) {
+	// boot builds a data dir whose config.json carries the given site_url,
+	// optionally pre-seeded with a marker from a previous extension boot.
+	boot := func(siteURL, marker string) string {
+		dir := t.TempDir()
+		body := `{}`
+		if siteURL != "" {
+			body = `{"site_url": ` + strconv.Quote(siteURL) + `}`
+		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "config.json"), []byte(body), 0o644))
+		if marker != "" {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, siteURLMarkerFile), []byte(marker), 0o644))
+		}
+		return dir
+	}
+	siteURLOf := func(dir string) string {
+		raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+		require.NoError(t, err)
+		var cfg map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &cfg))
+		v, _ := cfg["site_url"].(string)
+		return v
+	}
+	markerOf := func(dir string) string {
+		raw, err := os.ReadFile(filepath.Join(dir, siteURLMarkerFile))
+		if err != nil {
+			return "<absent>"
+		}
+		return strings.TrimSpace(string(raw))
+	}
+
+	t.Run("fresh default adopts SITE_URL", func(t *testing.T) {
+		dir := boot("", "")
+		require.NoError(t, ensurePlaceholderDist(dir, "/files"))
+		assert.Equal(t, "/files", siteURLOf(dir))
+		assert.Equal(t, "/files", markerOf(dir))
+	})
+
+	t.Run("steady state is untouched", func(t *testing.T) {
+		dir := boot("/files", "/files")
+		require.NoError(t, ensurePlaceholderDist(dir, "/files"))
+		assert.Equal(t, "/files", siteURLOf(dir))
+	})
+
+	t.Run("SITE_URL change wins over the value we wrote", func(t *testing.T) {
+		dir := boot("/files", "/files")
+		require.NoError(t, ensurePlaceholderDist(dir, "/docs"))
+		assert.Equal(t, "/docs", siteURLOf(dir))
+		assert.Equal(t, "/docs", markerOf(dir))
+	})
+
+	t.Run("unmarked config carrying the value is adopted (migration)", func(t *testing.T) {
+		// A deployment of the pre-marker releases wrote SITE_URL into
+		// config.json without a marker; upgrading must not refuse.
+		dir := boot("/files", "")
+		require.NoError(t, ensurePlaceholderDist(dir, "/files"))
+		assert.Equal(t, "/files", siteURLOf(dir))
+		assert.Equal(t, "/files", markerOf(dir))
+	})
+
+	t.Run("operator edit is refused, not clobbered", func(t *testing.T) {
+		dir := boot("https://example.com/files", "/files")
+		err := ensurePlaceholderDist(dir, "/files")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "site_url")
+		assert.Contains(t, err.Error(), "https://example.com/files")
+		assert.Equal(t, "https://example.com/files", siteURLOf(dir),
+			"a refused boot must leave the operator's value in place")
+	})
+
+	t.Run("pre-existing OpenList config is refused", func(t *testing.T) {
+		dir := boot("/their-path", "")
+		err := ensurePlaceholderDist(dir, "")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "SITE_URL")
+		assert.Equal(t, "/their-path", siteURLOf(dir))
+	})
+
+	t.Run("reset-to-default is adopted", func(t *testing.T) {
+		// The operator reset site_url to OpenList's pristine "": SITE_URL
+		// takes over again.
+		dir := boot("", "/files")
+		require.NoError(t, ensurePlaceholderDist(dir, "/files"))
+		assert.Equal(t, "/files", siteURLOf(dir))
+	})
 }
 
 // ---- download-route coverage (archive + share downloads) ----
@@ -385,7 +656,9 @@ func TestDownloadPath(t *testing.T) {
 		{"/sd/share1/", ""},
 		{"/sad/share1/file.zip/inner.txt", "/file.zip/inner.txt"},
 		{"/api/fs/get", ""},
-		{"/api/fs/get/x", "/x"},
+		// fs/get carries its path in the POST body; the URL never has one
+		// to extract (and no such route exists anyway).
+		{"/api/fs/get/x", ""},
 		{"/api/fs/list", ""},
 		{"/upload/file.txt", ""},
 	}
@@ -514,6 +787,146 @@ func TestSubpath_WrapperDoesNotMutateRequest(t *testing.T) {
 		"absolute-form request target must survive the wrapper intact")
 	assert.Equal(t, "/api/fs/list", absReq.URL.Path,
 		"the caller's request is untouched; the prefix lives on the internal clone")
+}
+
+// TestSubpath_WrapperStripsForwardedPrefix verifies the wrapper drops
+// X-Forwarded-Prefix before the engine routes the request. gin's
+// redirectTrailingSlash prepends that header to the redirect target it
+// builds, and every route is already under the base path — leaving the
+// header in place doubles the prefix on trailing-slash redirects
+// (/files/pingx/ => /files/files/pingx), which a Traefik or
+// X-Forwarded-Prefix-setting nginx in front would otherwise trigger. Both
+// proxy forms are covered, and the caller's request must keep its header.
+func TestSubpath_WrapperStripsForwardedPrefix(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+
+	cfg := config.Default()
+	cfg.AdminToken = "tok"
+	cfg.SiteURL = "/files"
+	srv, err := New(cfg)
+	require.NoError(t, err)
+
+	engine := srv.Engine(false)
+	engine.GET("/files/pingx", func(c *gin.Context) { c.String(200, "pong") })
+	handler := srv.subpathHandler(engine)
+
+	// A client that does NOT follow the redirect, so Location is inspectable.
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+
+	for _, path := range []string{
+		"/files/pingx/", // proxy passes the subpath through
+		"/pingx/",       // proxy strips the subpath
+	} {
+		req, err := http.NewRequest("GET", "http://backend"+path, nil)
+		require.NoError(t, err)
+		req.Header.Set("X-Forwarded-Prefix", "/files")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		// gin absolutizes the redirect Location against the request host;
+		// assert on the parsed path so the assertion is host-agnostic.
+		loc, err := url.Parse(rec.Header().Get("Location"))
+		require.NoError(t, err)
+		assert.Equal(t, "/files/pingx", loc.Path,
+			"trailing-slash redirect from %s must carry the base path exactly once", path)
+		assert.Equal(t, "/files", req.Header.Get("X-Forwarded-Prefix"),
+			"the caller's request must not be mutated")
+	}
+
+	// Without the header the redirect is the same single-prefix target.
+	req, err := http.NewRequest("GET", "http://backend/files/pingx/", nil)
+	require.NoError(t, err)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, "/files/pingx", loc.Path)
+
+	// And through a real server round trip (net/http normalizes request
+	// forms), the redirect is still single-prefix and the plain route
+	// serves.
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+	req, err = http.NewRequest("GET", ts.URL+"/files/pingx/", nil)
+	require.NoError(t, err)
+	req.Header.Set("X-Forwarded-Prefix", "/files")
+	resp, err := noRedirect.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	assert.Equal(t, http.StatusMovedPermanently, resp.StatusCode)
+	loc, err = url.Parse(resp.Header.Get("Location"))
+	require.NoError(t, err)
+	assert.Equal(t, "/files/pingx", loc.Path)
+}
+
+// TestSubpath_LBUploadAbortsBeforeRoute reproduces the production shape for
+// a load-balanced upload: real route handlers exist behind the feature
+// middleware (a stand-in for OpenList's PUT /fs/put route), and lbUpload
+// must ABORT after writing its response. Without the abort, gin's chain
+// continues into the route handler on a request whose body was already
+// consumed, appending a second response.
+func TestSubpath_LBUploadAbortsBeforeRoute(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+
+	stub := testutil.NewStubOpenList("test-admin-token")
+	defer stub.Close()
+
+	cfg := config.Default()
+	cfg.LoopbackAddr = stub.URL()
+	cfg.AdminToken = "test-admin-token"
+	cfg.DBPath = "" // already initialized
+	srv, err := New(cfg)
+	require.NoError(t, err)
+
+	var leakRuns int32
+	engine := srv.Engine(false)
+	engine.PUT("/api/fs/put", func(c *gin.Context) {
+		atomic.StoreInt32(&leakRuns, 1)
+		c.JSON(200, gin.H{"code": 200, "message": "route-leak"})
+	})
+	ts := httptest.NewServer(engine)
+	defer ts.Close()
+
+	// least_used, not round_robin: the round-robin counter is a
+	// process-global keyed by group ID, and every test's first group gets
+	// ID 1 in its fresh DB — one extra tick here would shift the start
+	// position of the round-robin tests that run later in the package.
+	require.NoError(t, lb.CreateGroup(&lb.Group{Name: "g90", UserID: 90, Strategy: lb.StrategyLeastUsed}))
+	groups, err := lb.ListGroups(90)
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.NoError(t, lb.AddMember(&lb.GroupMember{GroupID: groups[0].ID, MountPath: "/mnt90"}))
+	ck, err := apikey.Create(90, "u90", []apikey.Scope{apikey.ScopeWrite})
+	require.NoError(t, err)
+
+	req, err := http.NewRequest("PUT", ts.URL+"/api/fs/put", strings.NewReader("payload"))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+ck.Secret)
+	req.Header.Set("File-Path", "/orig.txt")
+	req.Header.Set("X-LB-Group", "g90")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	resp.Body.Close()
+
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.True(t, json.Valid(b), "response must be a single JSON document, got: %s", b)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&leakRuns), "the /api/fs/put route handler must not run")
+	var m map[string]interface{}
+	require.NoError(t, json.Unmarshal(b, &m))
+	d, ok := m["data"].(map[string]interface{})
+	require.True(t, ok, "response missing data: %v", m)
+	assert.Equal(t, "/mnt90/orig.txt", d["target_path"], "the LB member's mount path is the upload target")
+
+	// The upload itself landed in the (stub) storage at the rewritten path.
+	uploads := stub.SnapshotUploads()
+	require.Len(t, uploads, 1)
+	assert.Equal(t, "/mnt90/orig.txt", uploads[0].Path)
 }
 
 // TestSubpath_GuardsRunBeforeRouteHandlers reproduces the PRODUCTION shape,

@@ -66,7 +66,9 @@ OpenList may change its internals freely; as long as `server.Init(e)` and
    policy applies.
 2. **Per-user file TTL with auto-delete** — enable TTL per user; expiry by
    fixed time (`uploaded_at + duration`) or sliding access window (refreshed
-   on each download). A background reaper deletes expired files. Enable/disable
+   on each download — direct downloads, proxy and archive downloads, and
+   share downloads alike, the latter resolved through the share's roots). A
+   background reaper deletes expired files. Enable/disable
    per user.
 3. **Per-user list-permission control** — a user may read/write files but be
    forbidden from listing directories, or be a write-only drop box. Per-user
@@ -212,16 +214,26 @@ under `/files`:
   OpenList's own supported subpath mechanism: routes mount under the prefix
   and `base_path` is injected into the frontend's `index.html`, so the
   built UI requests `/files/api/...` and loads its assets from `/files/assets/...`.
+  The extension **owns** `site_url` (a sidecar marker in the data dir records
+  what it wrote): changing `SITE_URL` takes effect on the next boot, while a
+  `site_url` set directly in `config.json` (or left by a pre-existing
+  OpenList install) makes the boot refuse rather than silently overwrite
+  it — reconcile the two values and restart.
 - The extension's feature middleware (API keys, domains, list permissions,
   TTL), the admin API, and the curl upload endpoint all work relative to
-  the prefix; download links returned by `/upload/*` carry it.
+  the prefix; download links returned by `/upload/*` carry it. Share
+  downloads (`/sd/*`) refresh a file's sliding TTL window at the file's
+  real path, resolving the share id through OpenList's share API.
 - The service tolerates **both** proxy styles: proxies that pass the subpath
   through unchanged (nginx `proxy_pass http://backend:5245;`) and proxies
   that strip it before forwarding (nginx trailing-slash
   `proxy_pass http://backend:5245/;`, Caddy `handle_path`, Apache
   `ProxyPass /files/ http://backend:5245/`). Requests arriving without the
   prefix get it re-added before routing, so one `SITE_URL` value works with
-  either configuration.
+  either configuration. Proxies that set `X-Forwarded-Prefix` (e.g.
+  Traefik) are fine too: the header is dropped before routing, since gin
+  would otherwise prepend it to trailing-slash redirects that already
+  carry the base path.
 
 Proxy configs (with X-Forwarded-Host/Proto set so generated download links
 use the public host and scheme):
@@ -278,7 +290,9 @@ RedirectMatch 301 ^/files$ /files/
 Pick a base path that is not one of the service's own route prefixes
 (`/api`, `/d`, `/p`, `/ad`, `/sd`, `/dav`, `/s3`, `/ext`, `/upload`, ...):
 behind a prefix-stripping proxy a base path like `/d` is ambiguous — the
-stripped request `/d/file.txt` is indistinguishable from a prefixed one.
+stripped request `/d/file.txt` is indistinguishable from a prefixed one —
+so such base paths are rejected at startup with an error naming the
+collision.
 
 With WebDAV clients, mount the prefixed URL (`https://example.com/files/dav/`).
 Storages configured to 302-redirect downloads emit their own (absolute)

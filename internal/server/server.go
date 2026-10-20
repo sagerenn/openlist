@@ -31,6 +31,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -73,6 +74,11 @@ type Server struct {
 // the static AdminToken).
 func New(cfg config.Config) (*Server, error) {
 	base := cfg.BasePath()
+	if base != "" {
+		if err := validateBasePath(base); err != nil {
+			return nil, err
+		}
+	}
 	loopback := strings.TrimRight(cfg.LoopbackAddr, "/")
 	if base != "" {
 		// Routes live under the base path, so the in-process loopback
@@ -93,6 +99,40 @@ func New(cfg config.Config) (*Server, error) {
 	}
 	s.forward = func(c *gin.Context) { c.Next() }
 	return s, nil
+}
+
+// reservedBaseSegments are the top-level route segments served under the
+// base path: OpenList's own (server/router.go: ping, favicon.ico, robots.txt,
+// manifest.json, i, dav, s3, mcp, d, p, ad, ap, ae, sd, sad, api — debug only
+// under debug/dev flags) plus the extension's (ext, upload). Kept in sync
+// with the route surface validateBasePath guards against.
+var reservedBaseSegments = map[string]struct{}{
+	"ping": {}, "favicon.ico": {}, "robots.txt": {}, "manifest.json": {},
+	"i": {}, "dav": {}, "s3": {}, "mcp": {}, "debug": {},
+	"d": {}, "p": {}, "ad": {}, "ap": {}, "ae": {}, "sd": {}, "sad": {},
+	"api": {},
+	"ext": {}, "upload": {},
+}
+
+// validateBasePath refuses a base path whose first segment is one of the
+// top-level route segments above. The Handler wrapper decides between the
+// two proxy forms by asking "does the path already start with the base?":
+// a stripped request /d/file.txt (public /d/d/file.txt behind a
+// prefix-stripping proxy) starts with the base /d, so the wrapper would
+// route it as an already-prefixed path and the engine would 404 — the two
+// proxy forms are indistinguishable exactly when the base begins with a
+// route segment. Any other base (/files, /files/d, /my-site) is
+// unambiguous, because no stripped route path (/d/..., /api/..., /ext/...)
+// starts with it.
+func validateBasePath(base string) error {
+	first := strings.TrimPrefix(base, "/")
+	if i := strings.Index(first, "/"); i >= 0 {
+		first = first[:i]
+	}
+	if _, bad := reservedBaseSegments[first]; bad {
+		return fmt.Errorf("SITE_URL base path %q collides with the top-level route segment %q: behind a prefix-stripping proxy, %s requests are indistinguishable from already-prefixed ones and would 404 — choose a base path that is not itself a route segment (e.g. /files)", base, first, "/"+first)
+	}
+	return nil
 }
 
 // stripBase removes the configured base path prefix from p, returning the
@@ -219,12 +259,31 @@ func (s *Server) Engine(mountOpenList bool) *gin.Engine {
 // same SITE_URL setting, and URLs the service generates (download links,
 // redirects) always carry the prefix.
 func (s *Server) Handler(mountOpenList bool) http.Handler {
-	engine := s.Engine(mountOpenList)
+	return s.subpathHandler(s.Engine(mountOpenList))
+}
+
+// subpathHandler wraps the engine for subpath deployments; root deployments
+// get the engine untouched. Split from Handler so tests can wrap an engine
+// carrying their own routes.
+func (s *Server) subpathHandler(engine http.Handler) http.Handler {
 	if s.basePath == "" {
 		return engine
 	}
 	prefix := s.basePath
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// gin's redirectTrailingSlash prepends X-Forwarded-Prefix to the
+		// redirect target it builds, and every route here is ALREADY under
+		// that prefix — so a proxy that sets the header (Traefik, some
+		// nginx setups) would produce /files/files/ping from a /files/ping/
+		// request. The header is a proxy→app signal this engine has no use
+		// for, so drop it on a clone of the request before routing. A
+		// clone, because handlers must not modify the request they are
+		// given (the same rule the re-prefixing branch below follows).
+		if r.Header.Get("X-Forwarded-Prefix") != "" {
+			r2 := r.Clone(r.Context())
+			r2.Header.Del("X-Forwarded-Prefix")
+			r = r2
+		}
 		if r.RequestURI == "*" ||
 			r.URL.Path == prefix ||
 			strings.HasPrefix(r.URL.Path, prefix+"/") {
@@ -292,9 +351,11 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 		if c.IsAborted() {
 			return
 		}
-		// Load-balanced uploads are handled entirely in-process by lbUpload
-		// (it writes the response and aborts); otherwise apply TTL wrapping
-		// around the forwarder.
+		// Load-balanced uploads are handled entirely in-process by lbUpload,
+		// which writes the response and aborts (aborting is what keeps gin
+		// from continuing into the route handler behind it — the request
+		// body is already consumed); otherwise apply TTL wrapping around the
+		// forwarder.
 		if s.isLBUpload(c) {
 			s.lbUpload(c)
 			return

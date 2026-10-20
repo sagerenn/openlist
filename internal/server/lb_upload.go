@@ -66,7 +66,12 @@ func (s *Server) lbUpload(c *gin.Context) {
 	// Drain any remaining body so the connection can be reused.
 	_, _ = io.Copy(io.Discard, c.Request.Body)
 	_ = c.Request.Body.Close()
-	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": gin.H{
+	// Abort: the feature middleware invoked this handler as a plain call (not
+	// c.Next()), so without the abort gin's chain would continue into the
+	// route handler this request matched — a real PUT /fs/put route in
+	// production — which would try to serve a second response on a drained
+	// body. Every error path above aborts for the same reason.
+	c.AbortWithStatusJSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": gin.H{
 		"target_mount": member.MountPath,
 		"target_path":  targetPath,
 	}})

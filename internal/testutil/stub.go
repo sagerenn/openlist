@@ -12,16 +12,19 @@ import (
 
 // StubOpenList is a minimal stand-in for OpenList's HTTP API used in e2e
 // tests. It records calls and responds to the handful of endpoints the
-// extension talks to: /api/me, /api/fs/remove, /api/fs/put, and generic
-// passthrough. The real OpenList is not required for extension e2e tests.
+// extension talks to: /api/me, /api/fs/remove, /api/fs/put, /api/share/get,
+// the download routes (/d, /p, /sd), and generic passthrough. The real
+// OpenList is not required for extension e2e tests.
 type StubOpenList struct {
 	Server *httptest.Server
 
-	mu       sync.Mutex
-	Removes  []StubRemove
-	Uploads  []StubUpload
-	Gets     []string
-	Token    string // expected admin token
+	mu sync.Mutex
+	// Shares maps a share id to its root paths, served by /api/share/get.
+	Shares  map[string][]string
+	Removes []StubRemove
+	Uploads []StubUpload
+	Gets    []string
+	Token   string // expected admin token
 }
 
 // StubRemove records a remove call.
@@ -103,6 +106,31 @@ func NewStubOpenList(token string) *StubOpenList {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		_, _ = w.Write([]byte("proxy-bytes:" + r.URL.Path))
 	})
+	// Share downloads (/sd/<sid>/<path>): the path behind the share id is
+	// share-relative, mirroring OpenList's SharingDown routing.
+	mux.HandleFunc("/sd/", func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.Gets = append(s.Gets, r.URL.Path)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("share-bytes:" + r.URL.Path))
+	})
+	// Share metadata (GET /api/share/get?id=<sid>): serves s.Shares. Real
+	// OpenList returns the flattened SharingResp; only "files" matters here.
+	mux.HandleFunc("/api/share/get", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != s.Token {
+			writeJSON(w, 401, "unauthorized", nil)
+			return
+		}
+		s.mu.Lock()
+		files, ok := s.Shares[r.URL.Query().Get("id")]
+		s.mu.Unlock()
+		if !ok {
+			writeJSON(w, 404, "sharing not found", nil)
+			return
+		}
+		writeJSON(w, 200, "success", ginH{"files": files})
+	})
 	mux.HandleFunc("/api/fs/list", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, "success", ginH{"content": []interface{}{}, "total": 0})
 	})
@@ -142,6 +170,17 @@ func NewStubOpenList(token string) *StubOpenList {
 
 // Close shuts down the stub server.
 func (s *StubOpenList) Close() { s.Server.Close() }
+
+// SetShare registers a share id with its root paths, served by the
+// /api/share/get handler.
+func (s *StubOpenList) SetShare(sid string, files []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Shares == nil {
+		s.Shares = map[string][]string{}
+	}
+	s.Shares[sid] = files
+}
 
 // URL returns the stub server's base URL.
 func (s *StubOpenList) URL() string { return s.Server.URL }

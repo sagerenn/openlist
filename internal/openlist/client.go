@@ -210,6 +210,33 @@ func (c *Client) GetFile(ctx context.Context, fullPath string) (FileInfo, error)
 	return info, nil
 }
 
+// sharingResp is the subset of GET /api/share/get's data the extension
+// uses. OpenList's SharingResp embeds *model.Sharing anonymously, so its
+// fields (notably Files, json tag "files") arrive flattened at the top
+// level of data.
+type sharingResp struct {
+	Files []string `json:"files"`
+}
+
+// GetSharing returns the share's root paths (its Files) via GET
+// /api/share/get. It is what turns a share download URL (/sd/<sid>/<rel>)
+// into the logical file path a TTL record is keyed by: the share id maps to
+// its roots, and the URL's remainder is joined onto them (single root) or
+// resolved against the roots' base names (multi root), mirroring OpenList's
+// own op.GetSharingUnwrapPath. The endpoint requires a non-guest user; the
+// admin JWT this client sends satisfies it.
+func (c *Client) GetSharing(ctx context.Context, sid string) ([]string, error) {
+	out, err := c.do(ctx, http.MethodGet, "/api/share/get?id="+url.QueryEscape(sid), nil, "")
+	if err != nil {
+		return nil, err
+	}
+	var s sharingResp
+	if err := json.Unmarshal(out.Data, &s); err != nil {
+		return nil, fmt.Errorf("openlist: decode share/get data: %w", err)
+	}
+	return s.Files, nil
+}
+
 // Ping checks that OpenList is reachable and the token is valid by hitting
 // /api/me (admin current user). Returns nil on success.
 func (c *Client) Ping(ctx context.Context) error {
