@@ -91,8 +91,10 @@ To move to a newer upstream: rebase that one commit
    fixed time (`uploaded_at + duration`) or sliding access window (refreshed
    on each download — direct downloads, proxy and archive downloads, and
    share downloads alike, the latter resolved through the share's roots). A
-   background reaper deletes expired files. Enable/disable
-   per user.
+   background reaper deletes expired files and prunes their directories
+   when empty (never a storage mount root). Enable/disable
+   per user; an upload-time `X-Ttl: <seconds>` override expires that one
+   file even for a user whose TTL is off.
 3. **Per-user list-permission control** — a user may read/write files but be
    forbidden from listing directories, or be a write-only drop box. Per-user
    `can_list` / `can_read`.
@@ -237,6 +239,12 @@ SITE_URL=/files ./openlist-ext
 # or with a full URL (host part is ignored for routing, only the path matters):
 SITE_URL=https://example.com/files ./openlist-ext
 ```
+
+When the service is reachable on a non-default port, include it in the full
+URL (`SITE_URL=https://example.com:8443/files`): OpenList pins every link it
+mints (`raw_url`, download/sign URLs, the manage UI's previews) to the
+site_url origin, so a port-less value makes those links point at :443 —
+dead if nothing serves the app there.
 
 Every route — OpenList's own (`/api/*`, `/d/*`, `/p/*`, WebDAV at `/dav`,
 the web UI) and the extension's (`/ext/*`, `/upload/*`) — is then served
@@ -389,13 +397,26 @@ strategy. So a client that only knows the prefix (e.g. pshare configured
 with mount path `/pshare`) can upload, stat, list, and delete without any
 storage mounted at `/pshare`.
 
+**The prefix is visible in the file manager.** A root `fs/list` ("/")
+response carries one virtual directory entry per prefix the caller may
+see: the API-key user's own groups, or — for a browser session — every
+group for an admin, the session user's own otherwise (guests see none).
+Read routing resolves for session callers with the same scope, so an
+admin's file browser can click into the prefix, browse the member's
+files behind it, and remove through it (the owner's upload records are
+purged). Uploads stay API-key-only: `lbUpload` selects and records
+against the resolved user.
+
 Notes:
 - Every load-balanced upload is recorded (source path, member, physical
   path) — that is what the `lb/uploads` endpoints and the manage UI's
-  "LB Uploads" page show, and what read routing resolves through.
+  "LB Uploads" page show, and what read routing resolves through. The
+  page's **View** action jumps the file manager to the folder holding
+  the stored file.
 - LB uploads create TTL records against the physical target path (the
   reaper and `/d/` download access-refresh both key on it), honoring the
-  user's TTL config and `X-Ttl` override.
+  user's TTL config and `X-Ttl` override — an explicit `X-Ttl` applies
+  even when the user's TTL config is off (fixed-mode expiry by default).
 - Direct download routes (`/d`, `/p`, ...) are not rewritten: OpenList
   mints those URLs from `fs/get`'s `raw_url`, which already carries the
   physical path after the body rewrite.

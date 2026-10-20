@@ -386,6 +386,11 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 			}
 			return
 		}
+		// Root listings carry the user's virtual LB mounts as directories
+		// (see root_list.go); every other request forwards untouched.
+		if s.rewriteRootList(c) {
+			return
+		}
 		s.applyTTL(c, s.forward)
 	}
 }
@@ -427,6 +432,10 @@ func classifyPath(p string) pathKind {
 // (or query param) on the upload request — or by path: the (decoded)
 // File-Path falls under one of the resolved user's group prefixes, in
 // which case the group routes it with no header at all (see lb_route.go).
+// Path activation requires a resolved API-key user: lbUpload selects and
+// records against ctxUserID, which session-token callers (the manage
+// pages) do not have — their PUTs forward to OpenList like any other
+// authenticated write.
 func (s *Server) isLBUpload(c *gin.Context) bool {
 	if c.Request.Method != http.MethodPut {
 		return false
@@ -436,6 +445,9 @@ func (s *Server) isLBUpload(c *gin.Context) bool {
 	}
 	if lbGroupName(c) != "" {
 		return true
+	}
+	if _, ok := c.Get(ctxUserID); !ok {
+		return false
 	}
 	return s.lbPathRoute(c) != nil
 }

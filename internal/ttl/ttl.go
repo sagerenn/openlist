@@ -116,27 +116,32 @@ func RecordUpload(userID uint, path string, now time.Time) error {
 // computed from that duration instead of the user's configured duration,
 // enabling per-upload TTL while still defaulting to the user's setting when
 // the override is zero/absent. The record's Mode still follows the user's
-// config (fixed/access); only the duration is overridden. It is a no-op if
-// the user has TTL disabled — a per-file override cannot force TTL on for a
-// user who has it off.
+// config (fixed/access); only the duration is overridden.
+//
+// An explicit override applies even when the user has TTL disabled: the
+// uploader asked for THIS file to expire, so a record is created with
+// fixed-mode expiry (computeExpiry reads ModeDisabled as "never expires",
+// so the mode defaults to fixed rather than following the disabled config).
+// Only an absent/zero override is a no-op for a TTL-disabled user.
 func RecordUploadWithTTL(userID uint, path string, now time.Time, overrideSeconds int64) error {
 	cfg, err := GetConfig(userID)
 	if err != nil {
 		return err
 	}
-	if !cfg.Enabled || cfg.Mode == ModeDisabled {
-		return nil
-	}
 	if overrideSeconds > 0 {
-		// Build an effective config using the per-file duration. We keep the
-		// user's mode (fixed/access) so sliding-window semantics are honored
-		// when configured.
+		mode := cfg.Mode
+		if !cfg.Enabled || mode == ModeDisabled {
+			mode = ModeFixed
+		}
 		cfg = UserTTLConfig{
 			UserID:   cfg.UserID,
-			Mode:     cfg.Mode,
+			Mode:     mode,
 			Duration: overrideSeconds,
 			Enabled:  true,
 		}
+	}
+	if !cfg.Enabled || cfg.Mode == ModeDisabled {
+		return nil
 	}
 	rec := FileTTLRecord{
 		UserID:     userID,

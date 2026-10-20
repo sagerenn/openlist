@@ -244,9 +244,48 @@ func (c *Client) Ping(ctx context.Context) error {
 	return err
 }
 
+// RoleAdmin is OpenList's ADMIN role (model.UserRole: 0=GENERAL, 1=GUEST,
+// 2=ADMIN).
+const RoleAdmin = 2
+
 // meResp is the subset of /api/me's data the extension cares about.
 type meResp struct {
-	Role int `json:"role"`
+	ID   uint `json:"id"`
+	Role int  `json:"role"`
+}
+
+// Whoami resolves a session token to its OpenList user id and role via
+// GET /api/me, probing the given token directly (not the client's cached
+// admin JWT). Used where the extension must act on the identity behind a
+// request that carries an OpenList session token rather than an API key
+// (e.g. the admin manage pages browsing a group's virtual path prefix).
+func (c *Client) Whoami(ctx context.Context, token string) (id uint, role int, err error) {
+	if token == "" {
+		return 0, 0, fmt.Errorf("openlist: empty token")
+	}
+	var out apiResp
+	u := c.BaseURL + "/api/me"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return 0, 0, err
+	}
+	if out.Code != 200 {
+		return 0, 0, fmt.Errorf("openlist: /api/me code=%d msg=%s", out.Code, out.Message)
+	}
+	var me meResp
+	if err := json.Unmarshal(out.Data, &me); err != nil {
+		return 0, 0, err
+	}
+	return me.ID, me.Role, nil
 }
 
 // IsAdminToken reports whether the given token belongs to an OpenList admin
@@ -256,33 +295,32 @@ type meResp struct {
 // configured static admin token, so the frontend can manage extension
 // features with the same token it already uses for OpenList.
 func (c *Client) IsAdminToken(ctx context.Context, token string) bool {
-	if token == "" {
-		return false
-	}
-	// Probe the given token directly (not the client's cached admin JWT),
-	// so adminAuth can validate a frontend-supplied session token.
-	var out apiResp
-	u := c.BaseURL + "/api/me"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	_, role, err := c.Whoami(ctx, token)
+	return err == nil && role == RoleAdmin
+}
+
+// ListDirCount returns the number of entries in a directory's first listing
+// page (per_page=1): 0 means the directory is empty. Used by the TTL reaper
+// to decide whether a file's parent directory can be pruned after the file
+// was deleted. A listing error (e.g. the directory no longer exists) is
+// returned as an error so the caller can leave the directory alone.
+func (c *Client) ListDirCount(ctx context.Context, path string) (int, error) {
+	path = "/" + strings.TrimPrefix(path, "/")
+	payload, _ := json.Marshal(map[string]interface{}{
+		"path":     path,
+		"page":     1,
+		"per_page": 1,
+		"refresh":  false,
+	})
+	out, err := c.do(ctx, http.MethodPost, "/api/fs/list", bytes.NewReader(payload), "application/json")
 	if err != nil {
-		return false
+		return 0, err
 	}
-	req.Header.Set("Authorization", token)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return false
+	var d struct {
+		Content []json.RawMessage `json:"content"`
 	}
-	defer resp.Body.Close()
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return false
+	if err := json.Unmarshal(out.Data, &d); err != nil {
+		return 0, fmt.Errorf("openlist: decode fs/list data: %w", err)
 	}
-	if out.Code != 200 {
-		return false
-	}
-	var me meResp
-	if err := json.Unmarshal(out.Data, &me); err != nil {
-		return false
-	}
-	// OpenList UserRole: 0=GENERAL, 1=GUEST, 2=ADMIN.
-	return me.Role == 2
+	return len(d.Content), nil
 }

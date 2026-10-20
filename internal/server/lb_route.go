@@ -2,15 +2,18 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sagerenn/openlist/internal/lb"
+	"github.com/sagerenn/openlist/internal/openlist"
 )
 
 // Path-based load balancing (feature 4): a group with a PathPrefix is
@@ -42,6 +45,12 @@ import (
 type lbRoute struct {
 	group  lb.Group
 	prefix string // NormalizePrefix'd PathPrefix that matched
+	// user is the scope the route resolved against: the uploading/browsing
+	// user's id, or lb.UserAny for an admin's cross-user view. Record
+	// lookups and remove-purges use it so an admin operating through the
+	// prefix hits every user's records, not only their own (of which they
+	// have none).
+	user uint
 	// record pins the addressed file to the member its upload landed on
 	// (reads/removes); nil when there is no record and strategy-based
 	// routing applies.
@@ -53,6 +62,16 @@ type lbRoute struct {
 // user's group prefixes (or no user / no target path is resolvable). The
 // nil result is cached too, so the DB lookups happen at most once per
 // request no matter how many guards and handlers consult the route.
+//
+// Identity comes from either an API key (ctxUserID, the usual case) or an
+// OpenList session token — the manage pages' file browser sends those when
+// an admin browses a group's virtual prefix. A session admin resolves as
+// lb.UserAny, the same every-user view /ext/admin/lb/uploads gives them; a
+// general session user resolves as themselves, exactly like their API key
+// would. Guests and unprovable tokens keep the pass-through behavior. The
+// /api/me resolution is paid only when the target path actually falls
+// under some group's prefix, so ordinary physical-path browsing never
+// makes the round trip.
 func (s *Server) lbPathRoute(c *gin.Context) *lbRoute {
 	if v, ok := c.Get(ctxLBRoute); ok {
 		if v == nil {
@@ -60,26 +79,76 @@ func (s *Server) lbPathRoute(c *gin.Context) *lbRoute {
 		}
 		return v.(*lbRoute)
 	}
+	target := lbTargetPath(c)
+	uid, haveUser := c.Get(ctxUserID)
+	if !haveUser && target != "" {
+		if _, any := lb.MatchGroupByPath(lb.UserAny, target); any {
+			if su := s.resolveSessionUser(c); su != nil {
+				if su.admin {
+					uid = lb.UserAny
+				} else {
+					uid = su.userID
+				}
+				haveUser = true
+			}
+		}
+	}
 	var r *lbRoute
-	if uid, ok := c.Get(ctxUserID); ok {
-		if target := lbTargetPath(c); target != "" {
-			if g, found := lb.MatchGroupByPath(uid.(uint), target); found {
-				r = &lbRoute{group: g, prefix: lb.NormalizePrefix(g.PathPrefix)}
-				// Reads/removes follow the upload record when one exists —
-				// the file lives on the member it was uploaded to, which is
-				// not necessarily what the strategy would pick now.
-				// Uploads must not do this: they are creating the file, and
-				// the strategy decides where it lands.
-				if !isUploadPut(c) {
-					if rec, err := lb.FindUploadByPath(uid.(uint), target); err == nil {
-						r.record = rec
-					}
+	if haveUser && target != "" {
+		if g, found := lb.MatchGroupByPath(uid.(uint), target); found {
+			r = &lbRoute{group: g, prefix: lb.NormalizePrefix(g.PathPrefix), user: uid.(uint)}
+			// Reads/removes follow the upload record when one exists —
+			// the file lives on the member it was uploaded to, which is
+			// not necessarily what the strategy would pick now.
+			// Uploads must not do this: they are creating the file, and
+			// the strategy decides where it lands.
+			if !isUploadPut(c) {
+				if rec, err := lb.FindUploadByPath(uid.(uint), target); err == nil {
+					r.record = rec
 				}
 			}
 		}
 	}
 	c.Set(ctxLBRoute, r)
 	return r
+}
+
+// sessionUser is an OpenList session identity resolved lazily from the
+// request's Authorization token (an OpenList JWT, not an extension API
+// key). The manage pages' file browser sends these; API-key clients never
+// do.
+type sessionUser struct {
+	userID uint
+	admin  bool
+}
+
+// ctxSessionUser publishes the lazily-resolved session identity.
+const ctxSessionUser = "ext.session_user"
+
+// resolveSessionUser resolves the OpenList session identity behind the
+// request's Authorization header, caching the result in ctxSessionUser.
+// It returns nil (and caches nil) when the request carries no token or the
+// token does not resolve to a user (invalid token, guest). Resolution
+// calls /api/me on the loopback client, at most once per request.
+func (s *Server) resolveSessionUser(c *gin.Context) *sessionUser {
+	if v, ok := c.Get(ctxSessionUser); ok {
+		if v == nil {
+			return nil
+		}
+		return v.(*sessionUser)
+	}
+	var su *sessionUser
+	tok := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+	if tok != "" {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+		id, role, err := s.Client.Whoami(ctx, tok)
+		cancel()
+		if err == nil && id != 0 {
+			su = &sessionUser{userID: id, admin: role == openlist.RoleAdmin}
+		}
+	}
+	c.Set(ctxSessionUser, su)
+	return su
 }
 
 // isUploadPut reports whether the request is a PUT /api/fs/put.
@@ -283,15 +352,15 @@ func (s *Server) rewriteLBRead(c *gin.Context) *lbPurge {
 	}
 	// A remove: collect the removed names for the record purge. They ride
 	// in the same body ("names"), already peeked; the dir rewrite left
-	// them untouched.
-	uid := c.MustGet(ctxUserID).(uint)
+	// them untouched. The purge runs at the route's user scope, so an
+	// admin removing through the prefix purges the owning user's records.
 	var body struct {
 		Names []string `json:"names"`
 	}
 	if v, ok := c.Get(ctxBodyPeek); ok {
 		_ = json.Unmarshal(v.([]byte), &body)
 	}
-	return &lbPurge{userID: uid, dir: logical, names: body.Names}
+	return &lbPurge{userID: r.user, dir: logical, names: body.Names}
 }
 
 // purgeUploadRecords drops the upload records for files removed through a

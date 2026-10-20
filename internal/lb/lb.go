@@ -109,10 +109,21 @@ func AddMember(m *GroupMember) error {
 	return db.DB().Create(m).Error
 }
 
-// ListGroups returns all groups owned by userID.
+// UserAny is the cross-user scope used by admin views: wherever a function
+// takes a userID, UserAny (0) means "every user's" — the same every-user
+// view the /ext/admin endpoints give an admin. (Real OpenList user ids
+// start at 1, so 0 is unambiguous.)
+const UserAny uint = 0
+
+// ListGroups returns the groups owned by userID, or every group when
+// userID is UserAny.
 func ListGroups(userID uint) ([]Group, error) {
 	var gs []Group
-	err := db.DB().Where("user_id = ?", userID).Find(&gs).Error
+	q := db.DB()
+	if userID != UserAny {
+		q = q.Where("user_id = ?", userID)
+	}
+	err := q.Find(&gs).Error
 	return gs, err
 }
 
@@ -273,10 +284,11 @@ func DeleteGroup(groupID uint64) error {
 // ---- path-based activation ----
 
 // MatchGroupByPath returns the user's group whose PathPrefix contains p,
-// longest prefix first. The second return is false when no group's prefix
-// contains p (including the empty-prefix case: an empty PathPrefix never
-// activates a group by path, so groups used purely through the X-LB-Group
-// header keep their exact previous behavior).
+// longest prefix first; userID may be UserAny to match across every
+// user's groups (the admin's cross-user scope). The second return is false
+// when no group's prefix contains p (including the empty-prefix case: an
+// empty PathPrefix never activates a group by path, so groups used purely
+// through the X-LB-Group header keep their exact previous behavior).
 func MatchGroupByPath(userID uint, p string) (Group, bool) {
 	gs, err := ListGroups(userID)
 	if err != nil {
@@ -401,13 +413,16 @@ func ListUploads(userID uint, limit int) ([]UploadRecord, error) {
 }
 
 // FindUploadByPath returns the newest record whose SourcePath equals p for
-// userID — the record that pins which member holds that file. gorm's
-// ErrRecordNotFound maps to (nil, nil): "no record" is not an error, the
-// caller falls back to strategy-based routing.
+// userID (any user's, when userID is UserAny) — the record that pins which
+// member holds that file. gorm's ErrRecordNotFound maps to (nil, nil): "no
+// record" is not an error, the caller falls back to strategy-based routing.
 func FindUploadByPath(userID uint, p string) (*UploadRecord, error) {
 	var rec UploadRecord
-	err := db.DB().Where("user_id = ? AND source_path = ?", userID, p).
-		Order("id desc").Take(&rec).Error
+	q := db.DB().Where("source_path = ?", p)
+	if userID != UserAny {
+		q = q.Where("user_id = ?", userID)
+	}
+	err := q.Order("id desc").Take(&rec).Error
 	if err == gorm.ErrRecordNotFound {
 		return nil, nil
 	}
@@ -448,12 +463,16 @@ func DeleteUploadsUnder(userID uint, dir string) (int64, error) {
 
 // DeleteUploadsFor removes the records for the file dir/name — called when
 // a remove under a group prefix deletes that file, so the uploads view and
-// read routing stop pointing at it. Exact-path matching, in Go, for the
-// same reason as DeleteUploadsUnder.
+// read routing stop pointing at it. userID scopes the deletion (UserAny =
+// every user's records for that path, used when an admin removed the file
+// through the prefix). Exact-path matching, in Go, for the same reason as
+// DeleteUploadsUnder.
 func DeleteUploadsFor(userID uint, dir, name string) (int64, error) {
 	full := "/" + strings.TrimPrefix(dir, "/")
 	full = strings.TrimRight(full, "/") + "/" + strings.TrimPrefix(name, "/")
-	return db.DB().
-		Where("user_id = ? AND source_path = ?", userID, full).
-		Delete(&UploadRecord{}).RowsAffected, nil
+	q := db.DB().Where("source_path = ?", full)
+	if userID != UserAny {
+		q = q.Where("user_id = ?", userID)
+	}
+	return q.Delete(&UploadRecord{}).RowsAffected, nil
 }

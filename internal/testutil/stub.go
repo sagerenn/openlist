@@ -26,6 +26,9 @@ type StubOpenList struct {
 	Gets    []string
 	Lists   []string
 	Token   string // expected admin token
+	// listContent, when non-nil, is served as the content array of every
+	// /api/fs/list response instead of the default empty listing.
+	listContent []interface{}
 }
 
 // StubRemove records a remove call.
@@ -143,8 +146,12 @@ func NewStubOpenList(token string) *StubOpenList {
 		}
 		s.mu.Lock()
 		s.Lists = append(s.Lists, req.Path)
+		content := s.listContent
 		s.mu.Unlock()
-		writeJSON(w, 200, "success", ginH{"content": []interface{}{}, "total": 0})
+		if content == nil {
+			content = []interface{}{}
+		}
+		writeJSON(w, 200, "success", ginH{"content": content, "total": len(content)})
 	})
 	mux.HandleFunc("/api/fs/get", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -192,6 +199,19 @@ func (s *StubOpenList) SetShare(sid string, files []string) {
 		s.Shares = map[string][]string{}
 	}
 	s.Shares[sid] = files
+}
+
+// SetListContent makes every /api/fs/list response carry the given content
+// array instead of an empty listing. Test hook for code that inspects
+// listings (e.g. the TTL reaper's emptiness check).
+func (s *StubOpenList) SetListContent(content []map[string]interface{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]interface{}, len(content))
+	for i, c := range content {
+		out[i] = c
+	}
+	s.listContent = out
 }
 
 // URL returns the stub server's base URL.

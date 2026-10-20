@@ -83,15 +83,33 @@ func TestRecordUploadWithTTLOverride(t *testing.T) {
 	assert.Equal(t, now.Add(100*time.Second), neg.ExpiresAt)
 }
 
-func TestRecordUploadWithTTLOverrideNoopWhenDisabled(t *testing.T) {
+func TestRecordUploadWithTTLOverrideWorksWhenDisabled(t *testing.T) {
 	cleanup := testutil.SetupDB(t)
 	defer cleanup()
 
-	// User has TTL off; an override cannot force it on.
-	require.NoError(t, RecordUploadWithTTL(8, "/off.txt", time.Now(), 30))
-	has, err := HasRecord("/off.txt")
+	// User has TTL off. An explicit per-file override still expires THIS
+	// file — the uploader asked for it — defaulting to fixed mode (a
+	// disabled config carries ModeDisabled, which computeExpiry reads as
+	// "never expires"). A no-override upload stays a no-op.
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, RecordUploadWithTTL(8, "/off.txt", now, 30))
+	var r FileTTLRecord
+	require.NoError(t, dbFirstByPath("/off.txt", &r))
+	assert.Equal(t, now.Add(30*time.Second), r.ExpiresAt)
+	assert.Equal(t, ModeFixed, r.Mode)
+
+	require.NoError(t, RecordUploadWithTTL(8, "/none.txt", now, 0))
+	has, err := HasRecord("/none.txt")
 	require.NoError(t, err)
-	assert.False(t, has)
+	assert.False(t, has, "no override keeps the no-op for a TTL-disabled user")
+
+	// An explicitly-disabled config (Enabled=false) behaves the same.
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 8, Enabled: false, Mode: ModeFixed, Duration: 60}))
+	require.NoError(t, RecordUploadWithTTL(8, "/off2.txt", now, 45))
+	var r2 FileTTLRecord
+	require.NoError(t, dbFirstByPath("/off2.txt", &r2))
+	assert.Equal(t, now.Add(45*time.Second), r2.ExpiresAt)
+	assert.Equal(t, ModeFixed, r2.Mode)
 }
 
 func TestRecordUploadWithTTLOverrideAccessMode(t *testing.T) {

@@ -333,3 +333,199 @@ func TestE2E_CORSOnFeatureChainResponses(t *testing.T) {
 	assert.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"),
 		"guard denials must be readable by the cross-origin frontend")
 }
+
+// adminFsPost issues a POST /api/fs/<op> with the admin session token (the
+// manage pages' form of authentication: an OpenList session token, not an
+// extension API key).
+func adminFsPost(t *testing.T, extURL, op, body string) (int, map[string]interface{}) {
+	t.Helper()
+	req, err := http.NewRequest("POST", extURL+"/api/fs/"+op, strings.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "test-admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	var env map[string]interface{}
+	if len(b) > 0 {
+		require.NoError(t, json.Unmarshal(b, &env), "body: %s", string(b))
+	}
+	return resp.StatusCode, env
+}
+
+// listingNames extracts the entry names from an fs/list response envelope.
+func listingNames(t *testing.T, env map[string]interface{}) []string {
+	t.Helper()
+	data, ok := env["data"].(map[string]interface{})
+	require.True(t, ok, "data should be an object: %v", env["data"])
+	content, ok := data["content"].([]interface{})
+	require.True(t, ok, "content should be an array: %v", data["content"])
+	var names []string
+	for _, it := range content {
+		m, ok := it.(map[string]interface{})
+		require.True(t, ok, "entry should be an object: %v", it)
+		names = append(names, m["name"].(string))
+	}
+	return names
+}
+
+// TestE2E_RootListShowsVirtualMounts covers the file-manager
+// discoverability gap: OpenList's "/" listing shows only physical storages,
+// so a group's virtual /pshare prefix was invisible in the manage pages —
+// the admin could not even find it, let alone list it. The root listing now
+// carries a directory entry per prefix the requester may see: the API-key
+// user's own groups, an admin session's every group, and nothing for
+// guests. Non-root listings pass through un-amended.
+func TestE2E_RootListShowsVirtualMounts(t *testing.T) {
+	extURL, _, cleanup := setupE2E(t)
+	defer cleanup()
+
+	secret, _ := lbPathSetup(t, extURL, 58)
+
+	listRoot := func(header map[string]string) map[string]interface{} {
+		t.Helper()
+		req, err := http.NewRequest("POST", extURL+"/api/fs/list",
+			strings.NewReader(`{"path":"/","page":1,"per_page":0,"refresh":false}`))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range header {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, 200, resp.StatusCode, "body: %s", string(b))
+		var env map[string]interface{}
+		require.NoError(t, json.Unmarshal(b, &env), "body: %s", string(b))
+		return env
+	}
+
+	// API-key user: their group's prefix appears as a directory...
+	env := listRoot(map[string]string{"X-Api-Key": secret})
+	assert.Contains(t, listingNames(t, env), "pshare")
+	data := env["data"].(map[string]interface{})
+	assert.Equal(t, float64(1), data["total"], "total must count the injected entry")
+	// ...marked as a directory so the file browser navigates into it.
+	var injected map[string]interface{}
+	for _, it := range data["content"].([]interface{}) {
+		if m := it.(map[string]interface{}); m["name"] == "pshare" {
+			injected = m
+		}
+	}
+	require.NotNil(t, injected, "pshare entry must be present")
+	assert.Equal(t, true, injected["is_dir"])
+
+	// Admin session token: the manage file browser's form of auth — sees
+	// every user's prefixes (the same cross-user view the uploads page has).
+	env = listRoot(map[string]string{"Authorization": "test-admin-token"})
+	assert.Contains(t, listingNames(t, env), "pshare")
+
+	// Guest: no identity, no injection — the listing is exactly what
+	// OpenList returned.
+	env = listRoot(nil)
+	assert.NotContains(t, listingNames(t, env), "pshare")
+
+	// A non-root listing passes through un-amended.
+	code, env2 := lbFsPost(t, extURL, secret, "list", `{"path":"/somewhere"}`)
+	assert.Equal(t, 200, code)
+	assert.NotContains(t, listingNames(t, env2), "pshare")
+}
+
+// TestE2E_AdminSessionRoutesPrefix covers the second half of the
+// discoverability fix: the manage file browser authenticates with an
+// OpenList session token, not an API key, and read routing under a group
+// prefix used to resolve only for API-key callers — so even with /pshare
+// visible in the root listing, an admin clicking it would hit OpenList's
+// "storage not found" for the virtual path. Session callers now route too:
+// lists and gets under the prefix are re-pointed at the member that holds
+// the file, and a remove through the prefix purges the owner's upload
+// records (an admin's cross-user scope, like every other admin view).
+func TestE2E_AdminSessionRoutesPrefix(t *testing.T) {
+	extURL, stub, cleanup := setupE2E(t)
+	defer cleanup()
+
+	secret, _ := lbPathSetup(t, extURL, 59)
+	env := lbPutUpload(t, extURL, secret, "/pshare/one.txt", nil)
+	data := env["data"].(map[string]interface{})
+	mount := data["target_mount"].(string)
+
+	// fs/list of the prefix root: rewritten to a member's mount. Which
+	// member a record-less read resolves to is strategy state (the rr
+	// counter carries across tests), so assert membership, not identity.
+	code, _ := adminFsPost(t, extURL, "list", `{"path":"/pshare"}`)
+	assert.Equal(t, 200, code)
+	lists := stub.SnapshotLists()
+	require.NotEmpty(t, lists)
+	assert.Contains(t, []string{"/s3", "/oss"}, lists[len(lists)-1],
+		"session list under the prefix must be rewritten to a member mount")
+
+	// fs/get of the uploaded file: pinned by the upload record to the
+	// member it landed on, across users for an admin.
+	code, _ = adminFsPost(t, extURL, "get", `{"path":"/pshare/one.txt"}`)
+	assert.Equal(t, 200, code)
+	gets := stub.SnapshotGets()
+	require.NotEmpty(t, gets)
+	assert.Equal(t, mount+"/one.txt", gets[len(gets)-1],
+		"session get must resolve to the record's physical path")
+
+	// fs/remove through the prefix: the owner's records are purged.
+	code, _ = adminFsPost(t, extURL, "remove", `{"dir":"/pshare","names":["one.txt"]}`)
+	assert.Equal(t, 200, code)
+	removes := stub.SnapshotRemoves()
+	require.NotEmpty(t, removes)
+	last := removes[len(removes)-1]
+	assert.Contains(t, []string{"/s3", "/oss"}, last.Dir)
+	assert.Equal(t, []string{"one.txt"}, last.Names)
+	resp := adminDo(t, "GET", extURL+"/ext/admin/lb/uploads?user_id=59", "")
+	require.Equal(t, 200, resp.StatusCode)
+	m := respBody(t, resp)
+	assert.Empty(t, m["data"], "admin remove through the prefix must purge the owner's record")
+}
+
+// TestE2E_LBUploadTTLOverrideWithoutUserConfig reproduces the live
+// complaint that LB-uploaded files never expired: an explicit X-Ttl was
+// silently dropped whenever the uploading user's own TTL config was off —
+// no record, no deletion, ever. The override now applies regardless,
+// defaulting to fixed mode, and the reaper deletes the file (and prunes
+// its share-style directory) at the physical path the strategy wrote.
+func TestE2E_LBUploadTTLOverrideWithoutUserConfig(t *testing.T) {
+	extURL, stub, cleanup := setupE2E(t)
+	defer cleanup()
+
+	// NOTE: user 60's TTL config is deliberately NOT enabled.
+	secret, _ := lbPathSetup(t, extURL, 60)
+
+	env := lbPutUpload(t, extURL, secret, "/pshare/sub/gone.txt", map[string]string{"X-Ttl": "1"})
+	data := env["data"].(map[string]interface{})
+	targetPath := data["target_path"].(string)
+
+	has, err := ttl.HasRecord(targetPath)
+	require.NoError(t, err)
+	assert.True(t, has, "explicit X-Ttl must record TTL even when the user's config is off")
+
+	time.Sleep(1100 * time.Millisecond)
+	resp := adminDo(t, "POST", extURL+"/ext/admin/ttl/sweep", "")
+	require.Equal(t, 200, resp.StatusCode)
+	m := respBody(t, resp)
+	assert.Equal(t, float64(1), m["data"].(map[string]interface{})["deleted"])
+
+	// The file was deleted at its physical path, and the now-empty
+	// share-style directory under the mount was pruned with it.
+	removes := stub.SnapshotRemoves()
+	require.Len(t, removes, 2)
+	dir := targetPath[:strings.LastIndex(targetPath, "/")]
+	name := targetPath[strings.LastIndex(targetPath, "/")+1:]
+	assert.Equal(t, dir, removes[0].Dir)
+	assert.Equal(t, []string{name}, removes[0].Names)
+	parent := dir[:strings.LastIndex(dir, "/")]
+	assert.Equal(t, parent, removes[1].Dir)
+	assert.Equal(t, []string{dir[strings.LastIndex(dir, "/")+1:]}, removes[1].Names)
+
+	has, err = ttl.HasRecord(targetPath)
+	require.NoError(t, err)
+	assert.False(t, has)
+}

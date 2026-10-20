@@ -58,6 +58,85 @@ func TestReaperSweepNothingExpired(t *testing.T) {
 	assert.Empty(t, stub.SnapshotRemoves())
 }
 
+func TestReaperPrunesEmptyParentDirs(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+	stub := testutil.NewStubOpenList("tok")
+	defer stub.Close()
+
+	// A share-style upload: a per-share directory directly under a mount,
+	// holding one file. When the file expires, the directory is clutter —
+	// the reaper must prune it once the listing comes back empty.
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 102, Enabled: true, Mode: ModeFixed, Duration: 1}))
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, RecordUpload(102, "/infini/share1/gone.txt", now))
+
+	r := NewReaper(openlist.New(stub.URL(), "tok"), time.Second, 50)
+	r.SetNow(func() time.Time { return now.Add(2 * time.Second) })
+
+	assert.Equal(t, 1, r.SweepOnce(context.Background()))
+
+	removes := stub.SnapshotRemoves()
+	require.Len(t, removes, 2, "the file, then the now-empty directory")
+	assert.Equal(t, "/infini/share1", removes[0].Dir)
+	assert.Equal(t, []string{"gone.txt"}, removes[0].Names)
+	assert.Equal(t, "/infini", removes[1].Dir)
+	assert.Equal(t, []string{"share1"}, removes[1].Names)
+
+	has, err := HasRecord("/infini/share1/gone.txt")
+	require.NoError(t, err)
+	assert.False(t, has)
+}
+
+func TestReaperNeverPrunesRootLevelDirs(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+	stub := testutil.NewStubOpenList("tok")
+	defer stub.Close()
+
+	// A file directly under a root-level directory: that directory may be a
+	// storage mount root, so it is never pruned even when empty.
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 103, Enabled: true, Mode: ModeFixed, Duration: 1}))
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, RecordUpload(103, "/s3/gone.txt", now))
+
+	r := NewReaper(openlist.New(stub.URL(), "tok"), time.Second, 50)
+	r.SetNow(func() time.Time { return now.Add(2 * time.Second) })
+
+	assert.Equal(t, 1, r.SweepOnce(context.Background()))
+
+	removes := stub.SnapshotRemoves()
+	require.Len(t, removes, 1, "only the file; its parent sits at root level")
+	assert.Equal(t, "/s3", removes[0].Dir)
+	assert.Equal(t, []string{"gone.txt"}, removes[0].Names)
+}
+
+func TestReaperKeepsDirWithRemainingEntries(t *testing.T) {
+	dbCleanup := testutil.SetupDB(t)
+	defer dbCleanup()
+	stub := testutil.NewStubOpenList("tok")
+	defer stub.Close()
+
+	// A parent that still has entries is left alone: OpenList's remove on
+	// a directory is a recursive RemoveAll, so the emptiness check is what
+	// keeps pruning from taking live files with it.
+	stub.SetListContent([]map[string]interface{}{{"name": "live.txt", "is_dir": false}})
+
+	require.NoError(t, SetConfig(UserTTLConfig{UserID: 104, Enabled: true, Mode: ModeFixed, Duration: 1}))
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	require.NoError(t, RecordUpload(104, "/infini/share2/gone.txt", now))
+
+	r := NewReaper(openlist.New(stub.URL(), "tok"), time.Second, 50)
+	r.SetNow(func() time.Time { return now.Add(2 * time.Second) })
+
+	assert.Equal(t, 1, r.SweepOnce(context.Background()))
+
+	removes := stub.SnapshotRemoves()
+	require.Len(t, removes, 1, "only the file; its parent still has entries")
+	assert.Equal(t, "/infini/share2", removes[0].Dir)
+	assert.Equal(t, []string{"gone.txt"}, removes[0].Names)
+}
+
 func TestReaperStartStop(t *testing.T) {
 	dbCleanup := testutil.SetupDB(t)
 	defer dbCleanup()
