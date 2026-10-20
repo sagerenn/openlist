@@ -307,3 +307,5 @@ require (
 	modernc.org/sqlite v1.23.1 // indirect
 	resty.dev/v3 v3.0.0-beta.2 // indirect
 )
+
+replace github.com/OpenListTeam/OpenList/v4 => github.com/sagerenn/OpenList-1/v4 v4.2.6-sagerenn.1

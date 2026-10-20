@@ -59,6 +59,29 @@ database** keyed by OpenList user ID, never touching OpenList's schema.
 OpenList may change its internals freely; as long as `server.Init(e)` and
 `cmd.Init()` keep their signatures, the extension keeps working.
 
+### Core fork (go.mod `replace`)
+
+One patch over stock OpenList v4.2.6 lives in a core fork pinned by a
+`replace` directive:
+
+```
+replace github.com/OpenListTeam/OpenList/v4 => github.com/sagerenn/OpenList-1/v4 v4.2.6-sagerenn.1
+```
+
+Fork: [sagerenn/OpenList-1](https://github.com/sagerenn/OpenList-1), branch
+`fix/webdav-collection-stat`. The **webdav driver** `Get` now retries a failed
+`Stat` once with a trailing slash appended: some WebDAV servers (InfiniCloud)
+answer a `PROPFIND` on a collection URL *without* the trailing slash with a
+redirect/HTML 200 instead of the required 207 Multi-Status, which broke every
+upload into a subdirectory with `failed to get dir [...]: PROPFIND ...: 200`.
+ReadDir already stats with the slash; now `Get` does the same as a fallback.
+Not retried on 404 or when the path already ends in `/`, so the cost on sane
+servers is nil and the semantic is unchanged.
+
+To move to a newer upstream: rebase that one commit
+(`fix/webdav-collection-stat`) onto the upstream tag, retag
+`v4.2.X-sagerenn.1`, and bump the `replace` version.
+
 ## The six features
 
 1. **Per-user domain routing** — bind a host (e.g. `alice.example.com`) to a
