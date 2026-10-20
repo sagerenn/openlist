@@ -18,6 +18,7 @@ const (
 	ctxAuthSrc  = "ext.auth_src"  // "apikey" | "domain" | "token" | "guest"
 	ctxRelPath  = "ext.rel_path"  // base-path-relative request path
 	ctxPathKind = "ext.path_kind" // pathKind of the request
+	ctxLBRoute  = "ext.lb_route"  // *lbRoute resolved for this request (nil-able)
 )
 
 // apiKeyAuth resolves an API key presented in the request to a user. On

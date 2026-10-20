@@ -145,3 +145,161 @@ func TestDeleteGroupRemovesMembers(t *testing.T) {
 	_, err = GetGroup(g.ID)
 	assert.ErrorIs(t, err, ErrGroupNotFound)
 }
+
+func TestPrefixMatches(t *testing.T) {
+	cases := []struct {
+		prefix, p string
+		want      bool
+	}{
+		{"/pshare", "/pshare", true},
+		{"/pshare", "/pshare/x.txt", true},
+		{"/pshare", "/pshare/a/b.txt", true},
+		{"/pshare", "/psharex", false}, // segment boundary
+		{"/pshare", "/other/x.txt", false},
+		{"/pshare/", "/pshare/x.txt", true}, // trailing slash tolerated
+		{"pshare", "/pshare", true},         // missing lead tolerated
+		{"", "/pshare/x.txt", false},        // empty prefix never matches
+		{"/", "/anything", true},            // bare "/" matches everything
+		{"/", "/", true},
+		{"/a/b", "/a/b/c", true},
+		{"/a/b", "/a/bx", false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, PrefixMatches(tc.prefix, tc.p), "PrefixMatches(%q, %q)", tc.prefix, tc.p)
+	}
+}
+
+func TestNormalizePrefix(t *testing.T) {
+	assert.Equal(t, "", NormalizePrefix(""))
+	assert.Equal(t, "/", NormalizePrefix("/"))
+	assert.Equal(t, "/", NormalizePrefix("///"))
+	assert.Equal(t, "/pshare", NormalizePrefix("/pshare"))
+	assert.Equal(t, "/pshare", NormalizePrefix("pshare/"))
+	assert.Equal(t, "/a/b", NormalizePrefix("/a/b/"))
+}
+
+func TestRemapPath(t *testing.T) {
+	assert.Equal(t, "/s3/a/b.txt", RemapPath("/s3", "/pshare", "/pshare/a/b.txt"))
+	assert.Equal(t, "/s3/a b.txt", RemapPath("/s3", "/pshare", "/pshare/a b.txt"))
+	// The prefix root maps to the bare mount.
+	assert.Equal(t, "/s3", RemapPath("/s3", "/pshare", "/pshare"))
+	assert.Equal(t, "/s3", RemapPath("/s3", "/", "/"))
+	assert.Equal(t, "/s3/x", RemapPath("/s3", "/", "/x"))
+	// Mounts with trailing slashes are tolerated.
+	assert.Equal(t, "/s3/x", RemapPath("/s3/", "/pshare", "/pshare/x"))
+}
+
+func TestMatchGroupByPathLongestPrefix(t *testing.T) {
+	cleanup := testutil.SetupDB(t)
+	defer cleanup()
+
+	short := &Group{Name: "short", UserID: 60, PathPrefix: "/p"}
+	require.NoError(t, CreateGroup(short))
+	long := &Group{Name: "long", UserID: 60, PathPrefix: "/p/share"}
+	require.NoError(t, CreateGroup(long))
+	headerOnly := &Group{Name: "header-only", UserID: 60, PathPrefix: ""}
+	require.NoError(t, CreateGroup(headerOnly))
+	otherUser := &Group{Name: "other", UserID: 61, PathPrefix: "/p/share"}
+	require.NoError(t, CreateGroup(otherUser))
+
+	g, ok := MatchGroupByPath(60, "/p/share/a.txt")
+	require.True(t, ok)
+	assert.Equal(t, "long", g.Name, "longest prefix wins")
+
+	g, ok = MatchGroupByPath(60, "/p/other.txt")
+	require.True(t, ok)
+	assert.Equal(t, "short", g.Name)
+
+	_, ok = MatchGroupByPath(60, "/unrelated")
+	assert.False(t, ok)
+
+	// An empty prefix never activates by path, and another user's groups
+	// never activate for this user.
+	_, ok = MatchGroupByPath(60, "/p/share/a.txt/anything-still-long")
+	require.True(t, ok)
+	_, ok = MatchGroupByPath(61, "/p/share/a.txt")
+	require.True(t, ok)
+	_, ok = MatchGroupByPath(62, "/p/share/a.txt")
+	assert.False(t, ok)
+}
+
+func TestUploadRecordCRUD(t *testing.T) {
+	cleanup := testutil.SetupDB(t)
+	defer cleanup()
+
+	require.NoError(t, RecordUpload(&UploadRecord{
+		UserID: 70, GroupID: 1, GroupName: "g", SourcePath: "/p/x.txt",
+		TargetMount: "/s3", TargetPath: "/s3/x.txt", Size: 7,
+	}))
+	require.NoError(t, RecordUpload(&UploadRecord{
+		UserID: 70, GroupID: 1, GroupName: "g", SourcePath: "/p/y.txt",
+		TargetMount: "/oss", TargetPath: "/oss/y.txt", Size: 8,
+	}))
+	// Another user's record.
+	require.NoError(t, RecordUpload(&UploadRecord{
+		UserID: 71, GroupID: 1, GroupName: "g", SourcePath: "/p/z.txt",
+		TargetMount: "/s3", TargetPath: "/s3/z.txt",
+	}))
+
+	recs, err := ListUploads(70, 0)
+	require.NoError(t, err)
+	require.Len(t, recs, 2)
+	// Newest first.
+	assert.Equal(t, "/p/y.txt", recs[0].SourcePath)
+
+	recs, err = ListUploads(0, 1)
+	require.NoError(t, err)
+	require.Len(t, recs, 1, "limit applies; user 0 lists all users")
+
+	rec, err := FindUploadByPath(70, "/p/x.txt")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.Equal(t, "/s3/x.txt", rec.TargetPath)
+
+	rec, err = FindUploadByPath(70, "/p/none.txt")
+	require.NoError(t, err)
+	assert.Nil(t, rec, "missing record is (nil, nil), not an error")
+
+	rec, err = FindUploadByPath(71, "/p/x.txt")
+	require.NoError(t, err)
+	assert.Nil(t, rec, "records are per-user")
+
+	// Re-upload overwrites: newest record wins.
+	require.NoError(t, RecordUpload(&UploadRecord{
+		UserID: 70, GroupID: 1, GroupName: "g", SourcePath: "/p/x.txt",
+		TargetMount: "/oss", TargetPath: "/oss/x.txt",
+	}))
+	rec, err = FindUploadByPath(70, "/p/x.txt")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+	assert.Equal(t, "/oss/x.txt", rec.TargetPath, "newest record wins")
+
+	// Purge by dir/name: exact match only. Two records exist for /p/x.txt
+	// (the original and the overwrite — history is kept), both go.
+	n, err := DeleteUploadsFor(70, "/p", "x.txt")
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), n)
+	_, err = FindUploadByPath(70, "/p/x.txt")
+	require.NoError(t, err)
+	// y.txt survives.
+	rec, err = FindUploadByPath(70, "/p/y.txt")
+	require.NoError(t, err)
+	require.NotNil(t, rec)
+
+	// Purge a subtree.
+	n, err = DeleteUploadsUnder(70, "/p")
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+	recs, err = ListUploads(70, 0)
+	require.NoError(t, err)
+	assert.Empty(t, recs)
+
+	// Single-record delete.
+	recs, err = ListUploads(71, 0)
+	require.NoError(t, err)
+	require.Len(t, recs, 1)
+	require.NoError(t, DeleteUpload(recs[0].ID))
+	recs, err = ListUploads(71, 0)
+	require.NoError(t, err)
+	assert.Empty(t, recs)
+}

@@ -35,6 +35,10 @@ func (s *Server) registerAdminRoutes(g *gin.RouterGroup) {
 	g.GET("/lb/group", listLBGroups)
 	g.GET("/lb/group/:id", getLBGroup)
 	g.DELETE("/lb/group/:id", deleteLBGroup)
+	// Upload records: every load-balanced upload, for the admin uploads view
+	// (and its manual cleanup).
+	g.GET("/lb/uploads", listLBUploads)
+	g.DELETE("/lb/uploads/:id", deleteLBUpload)
 
 	// ---- Feature 5: API keys ----
 	g.POST("/apikey", createAPIKey)
@@ -216,11 +220,19 @@ func createLBGroup(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
 		return
 	}
+	// Normalize the prefix on write: a trailing slash (or a missing leading
+	// one) must not decide whether a path activates the group, and the
+	// path-activation matcher compares normalized forms. Empty stays empty —
+	// it means "header-only activation".
+	prefix := req.PathPrefix
+	if prefix != "" {
+		prefix = lb.NormalizePrefix(prefix)
+	}
 	g := &lb.Group{
 		Name:       req.Name,
 		UserID:     req.UserID,
 		Strategy:   lb.Strategy(req.Strategy),
-		PathPrefix: req.PathPrefix,
+		PathPrefix: prefix,
 	}
 	if err := lb.CreateGroup(g); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": err.Error()})
@@ -293,6 +305,47 @@ func deleteLBGroup(c *gin.Context) {
 		return
 	}
 	if err := lb.DeleteGroup(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success"})
+}
+
+// listLBUploads serves the uploads view: the newest load-balanced upload
+// records. ?user_id= restricts to one user (absent/0 = all users — an
+// admin's cross-user view), ?limit= caps the page (default 200, max 1000).
+func listLBUploads(c *gin.Context) {
+	var userID uint
+	if raw := c.Query("user_id"); raw != "" {
+		uid, ok := userIDQuery(c)
+		if !ok {
+			return
+		}
+		userID = uid
+	}
+	limit := 0
+	if raw := c.Query("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			limit = v
+		}
+	}
+	recs, err := lb.ListUploads(userID, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"code": 200, "data": recs})
+}
+
+// deleteLBUpload drops one upload record — metadata only; the stored file
+// is untouched (deleting the file is the reaper's or a remove's job).
+func deleteLBUpload(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "invalid id"})
+		return
+	}
+	if err := lb.DeleteUpload(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}

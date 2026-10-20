@@ -42,7 +42,8 @@ import (
 // The body is streamed (never buffered) to OpenList in-process via the
 // loopback admin client — the same code path load-balanced uploads use —
 // and the feature headers keep their /api/fs/put meaning: X-LB-Group
-// routes through an LB group, X-Ttl sets a per-file TTL override, and a
+// routes through an LB group (as does a target path under a group's
+// PathPrefix — see lb_route.go), X-Ttl sets a per-file TTL override, and a
 // TTL record is created when the user has TTL enabled.
 //
 // The response carries a download link (GET /d/<path>) built the same way
@@ -91,13 +92,22 @@ func (s *Server) curlUpload(c *gin.Context) {
 		return
 	}
 
-	// Optional load balancing: with X-LB-Group (or ?lb_group=), rewrite the
-	// directory prefix onto the selected member's mount path, exactly like
-	// lbUpload does for /api/fs/put. The original file name is preserved.
-	groupName := c.GetHeader("X-LB-Group")
-	if groupName == "" {
-		groupName = c.Query("lb_group")
-	}
+	// Optional load balancing, in two activation forms (mirroring lbUpload):
+	//   - explicit: X-LB-Group (or ?lb_group=) names the group; the target
+	//     becomes <mount><PathPrefix>/<name> — the original shape, source
+	//     directories dropped;
+	//   - by path: the target path falls under a group's PathPrefix for the
+	//     key's user; the prefix is replaced by the selected member's mount
+	//     path, preserving everything below it.
+	// The header wins when both apply. Groups are per-user, so both forms
+	// require an API key (an admin-token upload has no user to own a group).
+	origPath := targetPath
+	var (
+		lbGroup  *lb.Group
+		lbMember lb.GroupMember
+		lbByPath bool
+	)
+	groupName := lbGroupName(c)
 	if groupName != "" {
 		if !hasKey {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"code": 400, "message": "load-balanced upload requires an api key (group ownership)"})
@@ -113,11 +123,27 @@ func (s *Server) curlUpload(c *gin.Context) {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": err.Error()})
 			return
 		}
-		name := targetPath
-		if idx := strings.LastIndex(targetPath, "/"); idx >= 0 {
-			name = targetPath[idx+1:]
+		lbGroup, lbMember = &g, member
+	} else if hasKey {
+		if g, ok := lb.MatchGroupByPath(userID, targetPath); ok {
+			member, err := lb.Select(g)
+			if err != nil {
+				c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"code": 503, "message": err.Error()})
+				return
+			}
+			lbGroup, lbMember, lbByPath = &g, member, true
 		}
-		targetPath = strings.TrimRight(strings.TrimRight(member.MountPath, "/")+g.PathPrefix, "/") + "/" + name
+	}
+	if lbGroup != nil {
+		if lbByPath {
+			targetPath = lb.RemapPath(lbMember.MountPath, lb.NormalizePrefix(lbGroup.PathPrefix), targetPath)
+		} else {
+			name := targetPath
+			if idx := strings.LastIndex(targetPath, "/"); idx >= 0 {
+				name = targetPath[idx+1:]
+			}
+			targetPath = strings.TrimRight(strings.TrimRight(lbMember.MountPath, "/")+lbGroup.PathPrefix, "/") + "/" + name
+		}
 	}
 
 	// Stream the body to OpenList. UploadFile forwards with a real admin
@@ -142,6 +168,20 @@ func (s *Server) curlUpload(c *gin.Context) {
 			}
 		}
 		_ = ttl.RecordUploadWithTTL(userID, targetPath, time.Now(), override)
+		// Load-balanced uploads are also recorded as LB upload records:
+		// reads under the group prefix resolve through them, and they power
+		// the admin uploads view.
+		if lbGroup != nil {
+			_ = lb.RecordUpload(&lb.UploadRecord{
+				UserID:      userID,
+				GroupID:     lbGroup.ID,
+				GroupName:   lbGroup.Name,
+				SourcePath:  origPath,
+				TargetMount: lbMember.MountPath,
+				TargetPath:  targetPath,
+				Size:        size,
+			})
+		}
 	}
 
 	// Best-effort sign lookup for the download link. Sign is empty (and

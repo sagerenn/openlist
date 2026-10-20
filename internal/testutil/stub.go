@@ -24,6 +24,7 @@ type StubOpenList struct {
 	Removes []StubRemove
 	Uploads []StubUpload
 	Gets    []string
+	Lists   []string
 	Token   string // expected admin token
 }
 
@@ -132,6 +133,17 @@ func NewStubOpenList(token string) *StubOpenList {
 		writeJSON(w, 200, "success", ginH{"files": files})
 	})
 	mux.HandleFunc("/api/fs/list", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			Path string `json:"path"`
+		}
+		_ = json.Unmarshal(body, &req)
+		if req.Path == "" {
+			req.Path = r.URL.Query().Get("path")
+		}
+		s.mu.Lock()
+		s.Lists = append(s.Lists, req.Path)
+		s.mu.Unlock()
 		writeJSON(w, 200, "success", ginH{"content": []interface{}{}, "total": 0})
 	})
 	mux.HandleFunc("/api/fs/get", func(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +221,15 @@ func (s *StubOpenList) SnapshotGets() []string {
 	defer s.mu.Unlock()
 	out := make([]string, len(s.Gets))
 	copy(out, s.Gets)
+	return out
+}
+
+// SnapshotLists returns a copy of recorded list paths.
+func (s *StubOpenList) SnapshotLists() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.Lists))
+	copy(out, s.Lists)
 	return out
 }
 

@@ -354,10 +354,21 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 		// Load-balanced uploads are handled entirely in-process by lbUpload,
 		// which writes the response and aborts (aborting is what keeps gin
 		// from continuing into the route handler behind it — the request
-		// body is already consumed); otherwise apply TTL wrapping around the
-		// forwarder.
+		// body is already consumed). Reads/removes under a group prefix get
+		// their fs body rewritten before forwarding; a rewritten remove
+		// purges the affected upload records once the remove succeeds.
+		// Everything else applies TTL wrapping around the forwarder.
 		if s.isLBUpload(c) {
 			s.lbUpload(c)
+			return
+		}
+		if purge := s.rewriteLBRead(c); purge != nil {
+			rw := &statusRecorder{ResponseWriter: c.Writer, status: 200}
+			c.Writer = rw
+			s.applyTTL(c, s.forward)
+			if rw.status >= 200 && rw.status < 300 {
+				purgeUploadRecords(purge)
+			}
 			return
 		}
 		s.applyTTL(c, s.forward)
@@ -397,8 +408,10 @@ func classifyPath(p string) pathKind {
 }
 
 // isLBUpload reports whether the current request is an upload that should
-// be load-balanced. The caller signals this by setting the
-// "X-LB-Group" header (or query param) on the upload request.
+// be load-balanced. Activation is either explicit — the X-LB-Group header
+// (or query param) on the upload request — or by path: the (decoded)
+// File-Path falls under one of the resolved user's group prefixes, in
+// which case the group routes it with no header at all (see lb_route.go).
 func (s *Server) isLBUpload(c *gin.Context) bool {
 	if c.Request.Method != http.MethodPut {
 		return false
@@ -406,7 +419,10 @@ func (s *Server) isLBUpload(c *gin.Context) bool {
 	if s.pathKind(c) != kindAPIFS || !strings.HasSuffix(s.relPath(c), "/fs/put") {
 		return false
 	}
-	return c.GetHeader("X-LB-Group") != "" || c.Query("lb_group") != ""
+	if lbGroupName(c) != "" {
+		return true
+	}
+	return s.lbPathRoute(c) != nil
 }
 
 // adminAuth guards the admin API. It accepts either:

@@ -7,6 +7,22 @@
 // file through a group, the extension picks a target member according to
 // the group's strategy and routes the upload there.
 //
+// A group can be activated two ways:
+//
+//   - explicitly, by the X-LB-Group header (or ?lb_group=) on the upload —
+//     the original activation, where the group is chosen by name;
+//   - by path: an upload whose File-Path falls under the group's PathPrefix
+//     is routed through the group with no header at all. Path activation is
+//     what makes a group behave like a virtual mount: clients (e.g. pshare)
+//     address files by the prefix path, and the prefix is rewritten onto the
+//     selected member's mount path.
+//
+// Every load-balanced upload is recorded (UploadRecord): where the client
+// asked the file to go (the source path) and where it landed (the member's
+// physical path). Records power the admin uploads view and the read routing
+// that lets /api/fs/get, /api/fs/list, and /api/fs/remove under a group
+// prefix find the file again.
+//
 // Strategies:
 //   - StrategyRoundRobin: cycle through members in order, weighted.
 //   - StrategyLeastUsed:  pick the member with the fewest recorded uploads.
@@ -20,8 +36,10 @@ package lb
 import (
 	"errors"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagerenn/openlist/internal/db"
 	"gorm.io/gorm"
@@ -29,7 +47,7 @@ import (
 
 func init() {
 	db.RegisterModels(func() []interface{} {
-		return []interface{}{&Group{}, &GroupMember{}}
+		return []interface{}{&Group{}, &GroupMember{}, &UploadRecord{}}
 	})
 }
 
@@ -240,4 +258,192 @@ func DeleteGroup(groupID uint64) error {
 		return err
 	}
 	return db.DB().Delete(&Group{}, groupID).Error
+}
+
+// ---- path-based activation ----
+
+// MatchGroupByPath returns the user's group whose PathPrefix contains p,
+// longest prefix first. The second return is false when no group's prefix
+// contains p (including the empty-prefix case: an empty PathPrefix never
+// activates a group by path, so groups used purely through the X-LB-Group
+// header keep their exact previous behavior).
+func MatchGroupByPath(userID uint, p string) (Group, bool) {
+	gs, err := ListGroups(userID)
+	if err != nil {
+		return Group{}, false
+	}
+	var best Group
+	bestLen := -1
+	for _, g := range gs {
+		if !PrefixMatches(g.PathPrefix, p) {
+			continue
+		}
+		if l := len(NormalizePrefix(g.PathPrefix)); l > bestLen {
+			best, bestLen = g, l
+		}
+	}
+	return best, bestLen >= 0
+}
+
+// PrefixMatches reports whether p falls under prefix on a path-segment
+// boundary: "/pshare" matches "/pshare" and "/pshare/x" but not "/psharex".
+// An empty prefix never matches; a bare "/" matches everything.
+func PrefixMatches(prefix, p string) bool {
+	prefix = NormalizePrefix(prefix)
+	if prefix == "" {
+		return false
+	}
+	if prefix == "/" {
+		return true
+	}
+	p = "/" + strings.TrimPrefix(p, "/")
+	return p == prefix || strings.HasPrefix(p, prefix+"/")
+}
+
+// NormalizePrefix trims trailing slashes and re-leads with one, so callers
+// can join/compare uniformly. "" stays "" (never matches); "/" stays "/"
+// (matches everything).
+func NormalizePrefix(prefix string) string {
+	if prefix == "" {
+		return ""
+	}
+	prefix = strings.TrimRight(prefix, "/")
+	if prefix == "" {
+		return "/"
+	}
+	return "/" + strings.TrimPrefix(prefix, "/")
+}
+
+// RemapPath rewrites a logical path under a group prefix onto a member
+// mount: the prefix is replaced by the mount, everything below it is kept
+// ("/pshare/a/b.txt" under prefix "/pshare" on mount "/s3" becomes
+// "/s3/a/b.txt"). prefix must be NormalizePrefix'd; p must be under it.
+// The prefix root itself maps to the bare mount ("/s3", no trailing slash),
+// matching how OpenList cleans directory paths.
+func RemapPath(mount, prefix, p string) string {
+	rest := strings.TrimPrefix(p, prefix)
+	rest = "/" + strings.TrimPrefix(rest, "/")
+	if rest == "/" {
+		return strings.TrimRight(mount, "/")
+	}
+	return strings.TrimRight(mount, "/") + rest
+}
+
+// PickForRead selects a member for a read routed under a group prefix
+// WITHOUT incrementing its upload counter: reads must not distort the
+// upload balancing the strategies track.
+func PickForRead(g Group) (GroupMember, error) {
+	members, err := GroupMembers(g.ID)
+	if err != nil {
+		return GroupMember{}, err
+	}
+	if len(members) == 0 {
+		return GroupMember{}, ErrNoMembers
+	}
+	idx, err := pickIndex(g, members)
+	if err != nil {
+		return GroupMember{}, err
+	}
+	return members[idx], nil
+}
+
+// ---- upload records ----
+
+// UploadRecord is one load-balanced upload. SourcePath is the logical path
+// the client addressed (for path activation, under the group's prefix);
+// TargetMount/TargetPath are the member it landed on and the physical path
+// written. Records drive the admin uploads view and read routing: a later
+// fs/get on SourcePath resolves to TargetPath.
+type UploadRecord struct {
+	ID          uint64    `json:"id" gorm:"primaryKey"`
+	UserID      uint      `json:"user_id" gorm:"index;not null"`
+	GroupID     uint64    `json:"group_id" gorm:"index"`
+	GroupName   string    `json:"group_name" gorm:"size:128"`
+	SourcePath  string    `json:"source_path" gorm:"size:1024;not null"`
+	TargetMount string    `json:"target_mount" gorm:"size:512"`
+	TargetPath  string    `json:"target_path" gorm:"size:1024"`
+	Size        int64     `json:"size"`
+	CreatedAt   time.Time `json:"created_at" gorm:"index"`
+}
+
+// RecordUpload persists an upload record.
+func RecordUpload(rec *UploadRecord) error {
+	return db.DB().Create(rec).Error
+}
+
+// ListUploads returns the most recent upload records, newest first, for
+// userID — or for every user when userID is 0. limit <= 0 means the default
+// of 200; it is capped at 1000 so a huge history cannot be dumped in one
+// response.
+func ListUploads(userID uint, limit int) ([]UploadRecord, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	q := db.DB().Order("created_at desc, id desc").Limit(limit)
+	if userID != 0 {
+		q = q.Where("user_id = ?", userID)
+	}
+	var recs []UploadRecord
+	return recs, q.Find(&recs).Error
+}
+
+// FindUploadByPath returns the newest record whose SourcePath equals p for
+// userID — the record that pins which member holds that file. gorm's
+// ErrRecordNotFound maps to (nil, nil): "no record" is not an error, the
+// caller falls back to strategy-based routing.
+func FindUploadByPath(userID uint, p string) (*UploadRecord, error) {
+	var rec UploadRecord
+	err := db.DB().Where("user_id = ? AND source_path = ?", userID, p).
+		Order("id desc").Take(&rec).Error
+	if err == gorm.ErrRecordNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// DeleteUpload removes one record (metadata only — the stored file is
+// untouched).
+func DeleteUpload(id uint64) error {
+	return db.DB().Delete(&UploadRecord{}, id).Error
+}
+
+// DeleteUploadsUnder removes the records whose SourcePath is dir itself or
+// lies under it. Every record of the user is scanned (not the capped
+// ListUploads view), and prefix matching is done in Go (not SQL LIKE) so %
+// and _ in paths match literally. The count of removed records is returned.
+func DeleteUploadsUnder(userID uint, dir string) (int64, error) {
+	var recs []UploadRecord
+	if err := db.DB().Where("user_id = ?", userID).Find(&recs).Error; err != nil {
+		return 0, err
+	}
+	dir = "/" + strings.TrimPrefix(dir, "/")
+	var ids []uint64
+	for _, r := range recs {
+		sp := "/" + strings.TrimPrefix(r.SourcePath, "/")
+		if sp == dir || strings.HasPrefix(sp, dir+"/") {
+			ids = append(ids, r.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return db.DB().Where("id IN ?", ids).Delete(&UploadRecord{}).RowsAffected, nil
+}
+
+// DeleteUploadsFor removes the records for the file dir/name — called when
+// a remove under a group prefix deletes that file, so the uploads view and
+// read routing stop pointing at it. Exact-path matching, in Go, for the
+// same reason as DeleteUploadsUnder.
+func DeleteUploadsFor(userID uint, dir, name string) (int64, error) {
+	full := "/" + strings.TrimPrefix(dir, "/")
+	full = strings.TrimRight(full, "/") + "/" + strings.TrimPrefix(name, "/")
+	return db.DB().
+		Where("user_id = ? AND source_path = ?", userID, full).
+		Delete(&UploadRecord{}).RowsAffected, nil
 }

@@ -75,7 +75,9 @@ OpenList may change its internals freely; as long as `server.Init(e)` and
    `can_list` / `can_read`.
 4. **Upload load-balancing** — route uploads through a named LB group of
    backend mount paths; strategies `round_robin`, `least_used`, `random`
-   (weighted).
+   (weighted). Activate by `X-LB-Group` header or by upload path: a group
+   with a `path_prefix` behaves like a virtual mount, reads and removes
+   included. Every routed upload is recorded and viewable in the admin UI.
 5. **API-key auth + scoped operations** — issue per-user API keys with scopes
    (`fs.list`, `fs.get`, `fs.put`, `fs.rm`, `fs.mkdir`, or `*`). Keys are
    SHA-256 hashed with a prefix for lookup and constant-time comparison.
@@ -114,6 +116,8 @@ to the key's user, so the user's other features apply:
   groups (see feature 4); the path is rewritten to the chosen member's
   mount, the file name preserved, and `data.path` / `data.url` reflect the
   final location. Not available with the admin token (no owning user).
+  A target path under a group's `path_prefix` is routed the same way with
+  no header (path activation).
 - A TTL record is created when the user has TTL enabled (feature 2), and
   `X-Ttl: <seconds>` sets a per-file override, exactly as with
   `/api/fs/put`.
@@ -324,10 +328,50 @@ deployments, e.g. `/files/ext/admin`) and require the `Authorization:
 - `POST   /ext/admin/lb/group/:id/member` — `{"mount_path":"/s3","weight":1}`
 - `GET    /ext/admin/lb/group?user_id=10` (list) · `GET /ext/admin/lb/group/:id` (one)
 - `DELETE /ext/admin/lb/group/:id`
+- `GET    /ext/admin/lb/uploads` — the load-balanced upload records, newest
+  first. `?user_id=10` restricts to one user (absent = all users);
+  `?limit=N` caps the page (default 200, max 1000). Each record:
+  `{"id","user_id","group_id","group_name","source_path","target_mount","target_path","size","created_at"}`.
+- `DELETE /ext/admin/lb/uploads/:id` — drop one record (metadata only; the
+  stored file is untouched).
 
-To upload through a group: `PUT /api/fs/put` with header `X-LB-Group: g1`
-(and `File-Path: /orig/name.txt`). The extension picks a member and rewrites
-the path to `<mount><path_prefix>/<name>`.
+**Activating a group.** Two forms, both per the group's owning user:
+
+- **By name** (original): `PUT /api/fs/put` with header `X-LB-Group: g1`
+  (and `File-Path: /orig/name.txt`). The extension picks a member and rewrites
+  the path to `<mount><path_prefix>/<name>` — source directories dropped.
+  The same header works on `curl -T ... /upload/<path>`.
+- **By path** (new): give the group a `path_prefix` (e.g. `/pshare`) and
+  upload with `File-Path: /pshare/sub/dir/name.txt` — no header at all.
+  The prefix is replaced by the chosen member's mount path and everything
+  below it is preserved (`/pshare/sub/dir/name.txt` on mount `/infini`
+  lands at `/infini/sub/dir/name.txt`). `PUT/POST /upload/pshare/...` is
+  routed the same way. The header wins when both apply; an empty prefix
+  never activates by path. Longest prefix wins when prefixes nest.
+
+**Reads and removes under the prefix** are routed too, which is what makes
+the prefix behave like a virtual mount: `POST /api/fs/get`, `/api/fs/list`,
+and `/api/fs/remove` whose body path falls under the prefix are re-pointed
+at the member that actually holds the file — files uploaded through the
+group follow their upload record, anything else falls back to the group's
+strategy. So a client that only knows the prefix (e.g. pshare configured
+with mount path `/pshare`) can upload, stat, list, and delete without any
+storage mounted at `/pshare`.
+
+Notes:
+- Every load-balanced upload is recorded (source path, member, physical
+  path) — that is what the `lb/uploads` endpoints and the manage UI's
+  "LB Uploads" page show, and what read routing resolves through.
+- LB uploads create TTL records against the physical target path (the
+  reaper and `/d/` download access-refresh both key on it), honoring the
+  user's TTL config and `X-Ttl` override.
+- Direct download routes (`/d`, `/p`, ...) are not rewritten: OpenList
+  mints those URLs from `fs/get`'s `raw_url`, which already carries the
+  physical path after the body rewrite.
+- Path activation rewrites any upload whose `File-Path` starts with the
+  prefix for that user — if you also mount a real storage at the same
+  prefix, remove the prefix (header-only group) to keep the storage in
+  charge.
 
 ### API keys (feature 5)
 - `POST   /ext/admin/apikey` — `{"user_id":10,"name":"ci","scopes":["fs.get","fs.list"]}` → returns `{"secret":"..."}`
@@ -433,7 +477,7 @@ internal/
   domain/                    feature 1: per-user domain bindings
   ttl/                       feature 2: TTL config, file records, reaper
   listperm/                  feature 3: per-user list/read permission
-  lb/                        feature 4: LB groups, members, selection
+  lb/                        feature 4: LB groups, members, selection, upload records
   apikey/                    feature 5: API keys, scopes, verify
   openlist/                  loopback HTTP client for privileged ops
   server/                    engine: server.Init + feature middleware + admin API
