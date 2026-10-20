@@ -23,6 +23,12 @@
 // The extension listens on LISTEN_ADDR (default :5245). OpenList's data
 // directory is DATA_DIR (default "data"); its config.json and database are
 // created there on first run.
+//
+// The service can be deployed under a subpath behind a reverse proxy
+// (caddy, nginx, httpd, ...) by setting SITE_URL, e.g. SITE_URL=/files or
+// SITE_URL=https://example.com/files. All routes — OpenList's (/api, /d,
+// /p, the web UI) and the extension's (/ext, /upload) — are then served
+// under that prefix.
 package main
 
 import (
@@ -62,6 +68,7 @@ func main() {
 	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "OpenList data directory (config.json + its database)")
 	flag.IntVar(&cfg.ReaperIntervalSeconds, "reaper-interval", cfg.ReaperIntervalSeconds, "TTL reaper interval (seconds)")
 	flag.IntVar(&cfg.ReaperBatch, "reaper-batch", cfg.ReaperBatch, "TTL reaper batch size")
+	flag.StringVar(&cfg.SiteURL, "site-url", cfg.SiteURL, "public site URL or path prefix for subpath deployment (e.g. https://example.com/files or /files)")
 	flag.Parse()
 
 	// Allow env overrides for non-flag usage.
@@ -87,6 +94,9 @@ func main() {
 	if v := os.Getenv("DB_PATH"); v != "" {
 		cfg.DBPath = v
 	}
+	if v := os.Getenv("SITE_URL"); v != "" {
+		cfg.SiteURL = v
+	}
 	if v := os.Getenv("DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
@@ -100,7 +110,9 @@ func main() {
 	}
 
 	// Boot OpenList's internals in-process (config, DB, storages, data).
-	if err := server.BootOpenList(cfg.DataDir); err != nil {
+	// The site URL (subpath) is persisted into OpenList's config.json so
+	// OpenList's own routes mount under the same base path.
+	if err := server.BootOpenList(cfg.DataDir, cfg.SiteURL); err != nil {
 		log.Fatalf("failed to boot openlist: %v", err)
 	}
 
@@ -121,12 +133,17 @@ func main() {
 	reaper.Start()
 	defer reaper.Stop()
 
-	// Mount OpenList's routes + extension features on one engine.
-	engine := srv.Engine(true)
-	httpSrv := &http.Server{Addr: cfg.ListenAddr, Handler: engine}
+	// Mount OpenList's routes + extension features on one engine, wrapped
+	// for subpath deployments (re-prefixing requests from proxies that
+	// strip the subpath).
+	httpSrv := &http.Server{Addr: cfg.ListenAddr, Handler: srv.Handler(true)}
 
 	go func() {
-		log.Printf("openlist-ext listening on %s (OpenList embedded in-process)", cfg.ListenAddr)
+		if base := cfg.BasePath(); base != "" {
+			log.Printf("openlist-ext listening on %s (OpenList embedded in-process, base path %s)", cfg.ListenAddr, base)
+		} else {
+			log.Printf("openlist-ext listening on %s (OpenList embedded in-process)", cfg.ListenAddr)
+		}
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}

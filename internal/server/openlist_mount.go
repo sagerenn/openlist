@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -9,12 +10,25 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	olserver "github.com/OpenListTeam/OpenList/v4/server"
 	"github.com/gin-gonic/gin"
+	"github.com/sagerenn/openlist/internal/config"
 )
 
 // BootOpenList initializes OpenList's internals in-process (config, database,
 // storages, seed data) against the given data directory. It must be called
 // once before Engine(true) mounts OpenList's routes. Tests that supply a
 // stub forwarder call Engine(false) and do not need to boot OpenList.
+//
+// siteURL is the public site URL (full URL or bare path) the service is
+// served under; its path component is the base path. Pass "" for a root
+// deployment. It is written into OpenList's config.json as site_url, which
+// is OpenList's own supported mechanism for subpath deployments: bootstrap
+// parses it into conf.URL, server.Init mounts every route under
+// e.Group(conf.URL.Path), and the static handler injects base_path into
+// index.html so the frontend requests <base>/api/... . The extension layer
+// (feature middleware, /ext and /upload routes, loopback client, link
+// building) derives its view of the setting through OpenList's own
+// utils.FixAndCleanPath normalizer (see config.CanonicalSiteURL), so both
+// halves stay in sync for any input form.
 //
 // Only OpenList public packages are used (cmd, cmd/flags), preserving
 // forward compatibility.
@@ -41,7 +55,7 @@ import (
 // the embedded backend fully functional — without spawning a duplicate HTTP
 // server. The goroutine blocks on OutOpenListInit's signal wait for the
 // lifetime of the process, which is exactly what we want.
-func BootOpenList(dataDir string) error {
+func BootOpenList(dataDir, siteURL string) error {
 	flags.DataDir = dataDir
 	// Mirror all OpenList logging to stdout as well as the log file. Log()
 	// (called by cmd.Init below) otherwise redirects logrus and the standard
@@ -50,6 +64,10 @@ func BootOpenList(dataDir string) error {
 	// in docker logs.
 	flags.LogStd = true
 
+	if err := checkSiteURLEnvConflict(siteURL); err != nil {
+		return err
+	}
+
 	// Phase 1: generate the default config.json and initialize OpenList
 	// (database, admin user, settings). This does NOT mount routes, so the
 	// static-frontend fatal in server.Init is not yet reached.
@@ -57,11 +75,11 @@ func BootOpenList(dataDir string) error {
 
 	// Phase 2: point dist_dir at a placeholder frontend so server.Init's
 	// static route registration succeeds, disable OpenList's built-in HTTP
-	// listener (the extension serves via its own engine), then re-run
-	// cmd.Init to reload the patched config into OpenList's in-memory
-	// config. cmd.Init is idempotent (admin/guest users are only created
-	// when absent).
-	if err := ensurePlaceholderDist(dataDir); err != nil {
+	// listener (the extension serves via its own engine), set the site URL
+	// for subpath deployments, then re-run cmd.Init to reload the patched
+	// config into OpenList's in-memory config. cmd.Init is idempotent
+	// (admin/guest users are only created when absent).
+	if err := ensurePlaceholderDist(dataDir, siteURL); err != nil {
 		return err
 	}
 	cmd.Init()
@@ -74,8 +92,24 @@ func BootOpenList(dataDir string) error {
 	return nil
 }
 
+// checkSiteURLEnvConflict guards against an inherited OPENLIST_SITE_URL.
+// OpenList's bootstrap reads that variable from the environment (its
+// confFromEnv runs after config.json is loaded, so env wins) and would
+// override the site_url this extension writes — mounting OpenList's routes
+// under a different prefix than the extension's basePath, every route
+// 404ing, silently. Refuse to boot instead of serving a half-routed site;
+// matching base paths (e.g. the same value in full-URL and bare-path form)
+// are fine.
+func checkSiteURLEnvConflict(siteURL string) error {
+	v := os.Getenv("OPENLIST_SITE_URL")
+	if v == "" || config.NormalizeBasePath(v) == config.NormalizeBasePath(siteURL) {
+		return nil
+	}
+	return fmt.Errorf("OPENLIST_SITE_URL=%q conflicts with SITE_URL=%q: unset OPENLIST_SITE_URL and configure the subpath via SITE_URL only (it is written into OpenList's config.json for you)", v, siteURL)
+}
+
 // ensurePlaceholderDist creates <dataDir>/dist/index.html (if absent), sets
-// "dist_dir" in <dataDir>/config.json to that directory, and disables
+// "dist_dir" and "site_url" in <dataDir>/config.json, and disables
 // OpenList's built-in HTTP listener so the extension's own engine is the
 // sole server.
 //
@@ -83,7 +117,16 @@ func BootOpenList(dataDir string) error {
 // BootOpenList) run OpenList's storage-loading path without spawning a
 // duplicate HTTP server on OpenList's default port. See BootOpenList's doc
 // comment for the full rationale.
-func ensurePlaceholderDist(dataDir string) error {
+//
+// site_url (from the extension's SiteURL setting) selects the base path:
+// OpenList's bootstrap parses it into conf.URL and server.Init mounts all
+// routes under e.Group(conf.URL.Path). siteURL "" (root deployment) is
+// written verbatim: OpenList normalizes it to "/" — the same mount its
+// default "https://example.com" would produce — but empty keeps link
+// building request-derived (common.GetApiUrlFromRequest falls back to the
+// request's host when site_url has no scheme), whereas the example.com
+// placeholder would pin every generated link to a nonexistent host.
+func ensurePlaceholderDist(dataDir, siteURL string) error {
 	distDir := filepath.Join(dataDir, "dist")
 	if err := os.MkdirAll(distDir, 0o755); err != nil {
 		return err
@@ -98,7 +141,7 @@ func ensurePlaceholderDist(dataDir string) error {
 		}
 	}
 
-	// Patch dist_dir and scheme.http_port in config.json.
+	// Patch dist_dir, site_url and scheme.http_port in config.json.
 	configPath := filepath.Join(dataDir, "config.json")
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
@@ -109,6 +152,7 @@ func ensurePlaceholderDist(dataDir string) error {
 		return err
 	}
 	cfg["dist_dir"] = distDir
+	cfg["site_url"] = siteURL
 	// Disable OpenList's own HTTP listener: the extension serves everything
 	// through the gin engine built by Server.Engine. http_port = -1 makes
 	// bootstrap.Start skip its ListenAndServe while still running

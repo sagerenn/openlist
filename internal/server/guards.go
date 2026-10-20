@@ -34,7 +34,11 @@ func (s *Server) listPermGuard() gin.HandlerFunc {
 		if err != nil {
 			return
 		}
-		path := c.Request.URL.Path
+		// The feature middleware publishes the base-path-relative path in
+		// the context; matching on it (rather than the raw request path)
+		// makes the guard fire identically on subpath deployments, where
+		// requests arrive as <base>/api/fs/... .
+		path := s.relPath(c)
 
 		// Listing endpoint.
 		if strings.HasPrefix(path, "/api/fs/list") {
@@ -46,7 +50,7 @@ func (s *Server) listPermGuard() gin.HandlerFunc {
 				return
 			}
 		}
-		// Direct read endpoints.
+		// Read endpoints (file info and every direct download form).
 		if isReadPath(path) && !p.CanRead {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
 				"code":    403,
@@ -60,28 +64,30 @@ func (s *Server) listPermGuard() gin.HandlerFunc {
 // isReadPath reports whether the path targets a file read (not a write or
 // listing).
 func isReadPath(p string) bool {
-	return strings.HasPrefix(p, "/api/fs/get") ||
-		strings.HasPrefix(p, "/d/") ||
-		strings.HasPrefix(p, "/p/")
+	return strings.HasPrefix(p, "/api/fs/get") || isDownloadPath(p)
 }
 
 // applyTTL records TTL events around a forwarded file operation (feature 2).
 //
-//   - On download (/d/*, /p/*, /fs/get with link): refresh the access time
-//     for the path (ModeAccess sliding window), done before forwarding.
+//   - On download (/d, /p, the archive and share download routes, /fs/get
+//     with link): refresh the access time for the path (ModeAccess sliding
+//     window), done before forwarding.
 //   - On upload (PUT /fs/put, /fs/form): after a successful forwarded upload,
 //     record a TTL entry for the uploaded path (if the user has TTL on).
 //
 // forward is the terminal handler that actually serves the request
 // (OpenList's own route in production, a stub in tests).
 func (s *Server) applyTTL(c *gin.Context, forward gin.HandlerFunc) {
-	path := c.Request.URL.Path
+	// The feature middleware publishes the base-path-relative path
+	// (OpenList's route path): requests arrive as <base>/d/... on subpath
+	// deployments.
+	path := s.relPath(c)
 	method := c.Request.Method
 
 	// Download: refresh access time before forwarding. No-op if the file has
 	// no TTL record.
 	if isDownloadPath(path) {
-		fp := downloadPath(c)
+		fp := downloadPath(path)
 		if fp != "" {
 			_ = ttl.RecordAccess(fp, time.Now())
 		}
@@ -148,22 +154,59 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	return r.ResponseWriter.Write(b)
 }
 
-// isDownloadPath reports whether the path is a file download.
+// downloadPrefixes enumerates the direct download routes OpenList's
+// server/router.go registers: plain download /d, proxy download /p, archive
+// download /ad, archive proxy /ap, in-archive extract /ae, share download
+// /sd, and share archive extract /sad. One list feeds every path check
+// (classifyPath, isDownloadPath, downloadPath); adding a prefix here brings
+// a future OpenList download route under the feature chain wholesale.
+var downloadPrefixes = []string{"/d", "/p", "/ad", "/ap", "/ae", "/sd", "/sad"}
+
+// isDownloadPath reports whether the path targets a direct file download
+// (or its API equivalent, /api/fs/get).
 func isDownloadPath(p string) bool {
-	return strings.HasPrefix(p, "/d/") || strings.HasPrefix(p, "/p/") || strings.HasPrefix(p, "/api/fs/get")
+	if strings.HasPrefix(p, "/api/fs/get") {
+		return true
+	}
+	for _, prefix := range downloadPrefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // downloadPath extracts the logical file path from a download request URL.
-func downloadPath(c *gin.Context) string {
-	p := c.Request.URL.Path
-	for _, prefix := range []string{"/d/", "/p/", "/api/fs/get"} {
-		if strings.HasPrefix(p, prefix) {
-			rest := strings.TrimPrefix(p, prefix)
-			if rest == "" {
-				return ""
-			}
-			return "/" + strings.TrimPrefix(rest, "/")
+// p must be the base-path-relative path (OpenList's route path), not the
+// full request path. Share downloads (/sd/:sid/<path>, /sad/:sid/<path>)
+// carry a leading share-id segment that is not part of the file's path and
+// is skipped.
+func downloadPath(p string) string {
+	switch {
+	case strings.HasPrefix(p, "/api/fs/get"):
+		return downloadFilePath(strings.TrimPrefix(p, "/api/fs/get"))
+	case strings.HasPrefix(p, "/sd/") || strings.HasPrefix(p, "/sad/"):
+		// /sd/:sid/<path> — the share id is not part of the file path.
+		rest := strings.TrimPrefix(strings.TrimPrefix(p, "/sad"), "/sd")
+		if i := strings.Index(rest[1:], "/"); i >= 0 {
+			return downloadFilePath(rest[i+1:])
+		}
+		return ""
+	}
+	for _, prefix := range downloadPrefixes {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return downloadFilePath(strings.TrimPrefix(p, prefix))
 		}
 	}
 	return ""
+}
+
+// downloadFilePath turns the remainder after a download route prefix into
+// the logical file path ("/a/b.txt"), or "" when nothing follows.
+func downloadFilePath(rest string) string {
+	rest = "/" + strings.TrimPrefix(rest, "/")
+	if rest == "/" {
+		return ""
+	}
+	return rest
 }

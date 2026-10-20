@@ -163,6 +163,11 @@ docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/<owner>/openli
 # Run. State lives in the mounted /data volume.
 docker run -p 5245:5245 -v openlist-data:/data \
   -e OPENLIST_ADMIN_PASSWORD=changeme ghcr.io/<owner>/openlist-ext:latest
+
+# Run behind a reverse proxy at https://example.com/files/.
+docker run -p 5245:5245 -v openlist-data:/data \
+  -e OPENLIST_ADMIN_PASSWORD=changeme \
+  -e SITE_URL=https://example.com/files ghcr.io/<owner>/openlist-ext:latest
 ```
 
 The container runs as the unprivileged `openlist` user (uid 100, gid 101).
@@ -184,13 +189,106 @@ also publish `:<version>`).
 | `-data-dir`     | `DATA_DIR`       | `data`                   | OpenList data dir (config.json + its database)       |
 | `-db`           | `DB_PATH`        | `data/openlist-ext.db`   | Extension's own SQLite database                      |
 | `-admin-token`  | `ADMIN_TOKEN`    | (empty)                  | OpenList admin token for privileged in-process ops   |
+| `-site-url`     | `SITE_URL`       | (empty = root)           | Public site URL or path prefix for subpath deploy    |
 | `-reaper-interval` | —             | `60`                     | TTL reaper interval (seconds)                        |
 | `-reaper-batch` | —                | `100`                    | TTL reaper batch size                                |
 | —               | `OPENLIST_ADMIN_PASSWORD` | (random)      | Initial admin password on first run (OpenList core)  |
 
+## Subpath deployment (behind caddy / nginx / httpd)
+
+Set `SITE_URL` to serve the whole service under a path prefix — e.g. behind
+Caddy, nginx, or Apache httpd at `https://example.com/files/`:
+
+```bash
+SITE_URL=/files ./openlist-ext
+# or with a full URL (host part is ignored for routing, only the path matters):
+SITE_URL=https://example.com/files ./openlist-ext
+```
+
+Every route — OpenList's own (`/api/*`, `/d/*`, `/p/*`, WebDAV at `/dav`,
+the web UI) and the extension's (`/ext/*`, `/upload/*`) — is then served
+under `/files`:
+- The value is persisted to OpenList's `config.json` as `site_url`, which is
+  OpenList's own supported subpath mechanism: routes mount under the prefix
+  and `base_path` is injected into the frontend's `index.html`, so the
+  built UI requests `/files/api/...` and loads its assets from `/files/assets/...`.
+- The extension's feature middleware (API keys, domains, list permissions,
+  TTL), the admin API, and the curl upload endpoint all work relative to
+  the prefix; download links returned by `/upload/*` carry it.
+- The service tolerates **both** proxy styles: proxies that pass the subpath
+  through unchanged (nginx `proxy_pass http://backend:5245;`) and proxies
+  that strip it before forwarding (nginx trailing-slash
+  `proxy_pass http://backend:5245/;`, Caddy `handle_path`, Apache
+  `ProxyPass /files/ http://backend:5245/`). Requests arriving without the
+  prefix get it re-added before routing, so one `SITE_URL` value works with
+  either configuration.
+
+Proxy configs (with X-Forwarded-Host/Proto set so generated download links
+use the public host and scheme):
+
+```nginx
+# nginx — pass the subpath through
+location /files/ {
+    proxy_pass http://backend:5245;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+# bare /files (no trailing slash) never matches location /files/, so
+# redirect it explicitly; absolute_redirect keeps the Location under the
+# subpath instead of the proxy's own host.
+absolute_redirect off;
+location = /files {
+    return 301 /files/;
+}
+
+# nginx — strip the subpath (note the trailing slash)
+location /files/ {
+    proxy_pass http://backend:5245/;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    # The service itself already emits /files-prefixed Locations (it knows
+    # its SITE_URL), so rewrite from the prefixed backend URL — matching
+    # backend root here would double the prefix (/files/files/...).
+    proxy_redirect http://backend:5245/files/ /files/;
+}
+location = /files {
+    return 301 /files/;
+}
+```
+
+```
+# Caddy — handle_path strips the prefix
+handle_path /files/* {
+    reverse_proxy backend:5245
+}
+redir /files /files/ 301
+```
+
+```apache
+# Apache httpd — ProxyPass strips the prefix
+ProxyPass        /files/ http://backend:5245/
+# The service itself already emits /files-prefixed Locations (it knows its
+# SITE_URL), so reverse-map from the prefixed backend URL — matching the
+# backend root here would double the prefix (/files/files/...).
+ProxyPassReverse /files/ http://backend:5245/files/
+# bare /files (no trailing slash) is not matched by ProxyPass; redirect it
+RedirectMatch 301 ^/files$ /files/
+```
+
+Pick a base path that is not one of the service's own route prefixes
+(`/api`, `/d`, `/p`, `/ad`, `/sd`, `/dav`, `/s3`, `/ext`, `/upload`, ...):
+behind a prefix-stripping proxy a base path like `/d` is ambiguous — the
+stripped request `/d/file.txt` is indistinguishable from a prefixed one.
+
+With WebDAV clients, mount the prefixed URL (`https://example.com/files/dav/`).
+Storages configured to 302-redirect downloads emit their own (absolute)
+link URLs, which are unaffected by the base path; the proxy examples above
+rewrite those with `proxy_redirect` / `ProxyPassReverse` where needed.
+
 ## Admin API
 
-All admin routes are under `/ext/admin` and require the `Authorization:
+All admin routes are under `/ext/admin` (under the base path on subpath
+deployments, e.g. `/files/ext/admin`) and require the `Authorization:
 <admin-token>` header (or `?token=<admin-token>`).
 
 ### Domain (feature 1)
@@ -237,11 +335,15 @@ go test ./...
 OPENLIST_INTEGRATION=1 go test ./internal/server/... -run TestIntegration -v
 ```
 
-48 test functions across 7 packages. The e2e tests (`internal/server`)
+76 test functions across 7 packages. The e2e tests (`internal/server`)
 exercise every feature end-to-end through the engine's HTTP surface using a
-stub stand-in for OpenList's routes; the integration test boots the **real**
-OpenList in-process and verifies `/ping` and `/ext/healthz` coexist on one
-engine.
+stub stand-in for OpenList's routes; the subpath tests cover both proxy
+forms (prefix passed through and stripped), every download route family
+(plain, proxy, archive, share), link generation for both `SITE_URL`
+forms, and the production guard shape (real routes mounted on the engine —
+denials must arrive before the route handler runs); the integration test
+boots the **real** OpenList in-process under a `/files` subpath and
+verifies `/files/ping` and `/files/ext/healthz` coexist on one engine.
 
 ## CI/CD
 
@@ -251,7 +353,7 @@ Three GitHub workflows cover build, publish, and end-to-end testing.
 |---|---|---|---|
 | `ci.yml` | openlist-ext | push/PR to `main` | `go vet` + `go build` + `go test -race` |
 | `publish.yml` | openlist-ext | tag `v*` / dispatch | Multi-arch (`linux/amd64,linux/arm64`) Docker build + push to GHCR |
-| `e2e.yml` | OpenList-Frontend | push/PR to `main` | Builds the backend binary + frontend dist, boots the backend, runs Playwright E2E against it |
+| `e2e.yml` | OpenList-Frontend | push/PR to `main` | Builds the backend binary + frontend dist, boots the backend, runs Playwright E2E against it — twice: at the origin root and under a subpath (`SITE_URL=/files`) |
 
 ### `ci.yml` — build & test
 
@@ -288,6 +390,14 @@ end-to-end check that the frontend works against a real openlist-ext backend:
    login: `admin` / `admin`).
 6. Wait for `/ext/healthz` to return 200.
 7. `pnpm e2e:install` (Playwright chromium) + `pnpm e2e`.
+
+The whole matrix runs twice: at the origin root and under a base path
+(`SITE_URL=/files`), matching a deployment behind caddy / nginx / Apache
+httpd at `https://example.com/files/`. The subpath leg passes
+`E2E_BASE_PATH=/files`, which prefixes every in-app path in the specs and
+activates `e2e/subpath.spec.ts` (base-path injection into index.html,
+prefixed asset loading, no request escaping the prefix, and the index.html
+guard that redirects a direct visit to the host root into the prefix).
 
 The Playwright suite (`e2e/extension.spec.ts`) verifies: `/ext/healthz`
 returns 200; `/` serves the built frontend; the **Extension** menu group is

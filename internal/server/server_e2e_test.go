@@ -36,19 +36,48 @@ import (
 // test is identical either way.
 func setupE2E(t *testing.T) (extURL string, stub *testutil.StubOpenList, cleanup func()) {
 	t.Helper()
+	return setupE2EBase(t, "")
+}
+
+// setupE2EBase is setupE2E with a site URL (subpath) configured. The test
+// server uses Server.Handler, which wraps the engine so BOTH request forms
+// work: <base>/api/... (a proxy that passes the subpath through) and bare
+// /api/... (a proxy that strips it, e.g. nginx trailing-slash proxy_pass,
+// caddy handle_path, Apache ProxyPass).
+//
+// The stub OpenList serves root paths, so when a base path is set it is
+// re-served behind http.StripPrefix(base): the loopback client (which New
+// points at backend + base) and forwarded engine requests (which carry the
+// full <base>/... path) both reach it. This mirrors production, where
+// OpenList's routes are mounted under the same group.
+func setupE2EBase(t *testing.T, siteURL string) (extURL string, stub *testutil.StubOpenList, cleanup func()) {
+	t.Helper()
 	dbCleanup := testutil.SetupDB(t)
 	stub = testutil.NewStubOpenList("test-admin-token")
 
+	// Backend the extension talks to: the stub, optionally re-served under
+	// the base path.
+	base := config.NormalizeBasePath(siteURL)
+	backendURL := stub.URL()
+	var extraClosers []func()
+	if base != "" {
+		wrapped := httptest.NewServer(http.StripPrefix(base, stub.Server.Config.Handler))
+		extraClosers = append(extraClosers, wrapped.Close)
+		backendURL = wrapped.URL
+	}
+
 	cfg := config.Default()
-	cfg.LoopbackAddr = stub.URL()
+	cfg.LoopbackAddr = backendURL
 	cfg.AdminToken = "test-admin-token"
 	cfg.DBPath = "" // already initialized
+	cfg.SiteURL = siteURL
 
 	srv, err := New(cfg)
 	require.NoError(t, err)
 	// Stand in for OpenList's real routes: proxy non-intercepted file-op
-	// requests to the stub. (Production uses c.Next() into server.Init.)
-	target, err := url.Parse(stub.URL())
+	// requests to the stub backend. (Production uses c.Next() into
+	// server.Init.)
+	target, err := url.Parse(backendURL)
 	require.NoError(t, err)
 	proxy := &httputil.ReverseProxy{Director: func(r *http.Request) {
 		r.URL.Scheme = target.Scheme
@@ -57,11 +86,13 @@ func setupE2E(t *testing.T) (extURL string, stub *testutil.StubOpenList, cleanup
 	}}
 	srv.SetForwarder(func(c *gin.Context) { proxy.ServeHTTP(c.Writer, c.Request) })
 
-	engine := srv.Engine(false)
-	ts := httptest.NewServer(engine)
+	ts := httptest.NewServer(srv.Handler(false))
 
 	cleanup = func() {
 		ts.Close()
+		for _, closeFn := range extraClosers {
+			closeFn()
+		}
 		stub.Close()
 		dbCleanup()
 	}

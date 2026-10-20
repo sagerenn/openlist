@@ -9,11 +9,15 @@ import (
 	"github.com/sagerenn/openlist/internal/domain"
 )
 
-// context keys for the acting identity resolved by the extension.
+// context keys for the acting identity resolved by the extension, and for
+// the request's path normalization computed once by the feature
+// middleware (see Server.relPath / Server.pathKind).
 const (
-	ctxUserID  = "ext.user_id"
-	ctxAPIKey  = "ext.api_key"
-	ctxAuthSrc = "ext.auth_src" // "apikey" | "domain" | "token" | "guest"
+	ctxUserID   = "ext.user_id"
+	ctxAPIKey   = "ext.api_key"
+	ctxAuthSrc  = "ext.auth_src"  // "apikey" | "domain" | "token" | "guest"
+	ctxRelPath  = "ext.rel_path"  // base-path-relative request path
+	ctxPathKind = "ext.path_kind" // pathKind of the request
 )
 
 // apiKeyAuth resolves an API key presented in the request to a user. On
@@ -22,11 +26,18 @@ const (
 // executes as admin (the extension enforces the key's scopes itself). If
 // no key is present it does nothing (the next middleware may resolve a
 // domain or fall through to guest).
+//
+// It is a pure guard, not a standalone middleware: it must only return
+// (or Abort) — never call c.Next(). featureMiddleware invokes it directly,
+// and a c.Next() from inside it would advance the engine's handler chain
+// into the route handler BEFORE the remaining guards (domain, listPerm)
+// have run: a user denied listing would still receive the full listing
+// body, with the 403 appended after it. Only the orchestrator advances
+// the chain (via applyTTL's forward).
 func (s *Server) apiKeyAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		secret, err := apikey.FromHeader(c.GetHeader)
 		if err != nil {
-			c.Next()
 			return
 		}
 		k, err := apikey.Verify(secret)
@@ -47,7 +58,6 @@ func (s *Server) apiKeyAuth() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"code": 403, "message": "api key scope denied"})
 			return
 		}
-		c.Next()
 	}
 }
 
@@ -71,9 +81,11 @@ func scopeForPath(method, path string) apikey.Scope {
 }
 
 // checkScope verifies the resolved API key has the scope required by the
-// current request. Returns true if no key is in play.
+// current request. Returns true if no key is in play. The path is the
+// base-path-relative one the feature middleware published, so subpath
+// deployments (<base>/api/fs/...) map to the same scopes.
 func (s *Server) checkScope(c *gin.Context, k apikey.APIKey) bool {
-	required := scopeForPath(c.Request.Method, c.Request.URL.Path)
+	required := scopeForPath(c.Request.Method, s.relPath(c))
 	if required == apikey.ScopeAll {
 		return true
 	}
@@ -88,10 +100,13 @@ func (s *Server) checkScope(c *gin.Context, k apikey.APIKey) bool {
 // context; the request is forwarded as guest (no token) so OpenList
 // applies guest permissions, but the extension's listPermGuard and
 // ttlGuard use the resolved user ID to enforce per-user policy.
+//
+// Like apiKeyAuth it is a pure guard orchestrated by featureMiddleware:
+// it never calls c.Next() (see apiKeyAuth's doc comment for why that
+// would run the route handler before the remaining guards).
 func (s *Server) domainAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if _, ok := c.Get(ctxUserID); ok {
-			c.Next()
 			return
 		}
 		host := c.Request.Host
@@ -101,7 +116,6 @@ func (s *Server) domainAuth() gin.HandlerFunc {
 		uid, ok := domain.LookupUserID(host)
 		if !ok {
 			c.Set(ctxAuthSrc, "guest")
-			c.Next()
 			return
 		}
 		c.Set(ctxUserID, uid)
@@ -109,6 +123,5 @@ func (s *Server) domainAuth() gin.HandlerFunc {
 		// Do NOT set admin token: forward as guest so OpenList enforces
 		// guest visibility. The extension still tracks per-user policy
 		// by uid.
-		c.Next()
 	}
 }

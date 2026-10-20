@@ -23,7 +23,7 @@
 // list permissions, LB groups, and API keys per user.
 //
 // Forward compatibility: only OpenList public packages are imported
-// (cmd, cmd/flags, server, server/handles, server/middlewares,
+// (cmd, cmd/flags, pkg/utils, server, server/handles, server/middlewares,
 // server/common). No internal/ package is imported, so OpenList may change
 // its internals freely; as long as server.Init(e) and cmd.Init() keep their
 // signatures, the extension keeps working.
@@ -43,6 +43,12 @@ import (
 type Server struct {
 	Config config.Config
 	Client *openlist.Client
+	// basePath is the URL path prefix the whole service is served under
+	// ("" for root deployments, "/prefix" otherwise). It mirrors the path
+	// component of OpenList's site_url: server.Init mounts OpenList's routes
+	// under the same prefix, so the extension's routes, path checks, and
+	// generated links must all include it too.
+	basePath string
 	// forward is the terminal handler invoked after the feature middleware
 	// chain passes a request through. In production it is c.Next(), letting
 	// OpenList's own routes (mounted via server.Init) serve the request. In
@@ -59,14 +65,27 @@ type Server struct {
 }
 
 // New constructs a Server. The loopback client is built from the config's
-// LoopbackAddr (the address the engine will listen on) and the admin token.
-// When AdminPassword is set, a TokenManager is created so the extension can
-// obtain and refresh a real admin JWT for forwarding to OpenList's core
-// (which only accepts JWTs, not the static AdminToken).
+// LoopbackAddr (the address the engine will listen on) and the admin token;
+// when a base path is configured the client targets the prefixed location,
+// because OpenList's routes are mounted under it. When AdminPassword is set,
+// a TokenManager is created so the extension can obtain and refresh a real
+// admin JWT for forwarding to OpenList's core (which only accepts JWTs, not
+// the static AdminToken).
 func New(cfg config.Config) (*Server, error) {
+	base := cfg.BasePath()
+	loopback := strings.TrimRight(cfg.LoopbackAddr, "/")
+	if base != "" {
+		// Routes live under the base path, so the in-process loopback
+		// calls (/api/me, /api/fs/put, ...) must hit the prefixed paths
+		// (e.g. http://127.0.0.1:5245/files/api/me). An operator-supplied
+		// loopback address that already carries the path is not
+		// double-prefixed.
+		loopback = strings.TrimRight(strings.TrimSuffix(loopback, base), "/") + base
+	}
 	s := &Server{
-		Config: cfg,
-		Client: openlist.New(cfg.LoopbackAddr, cfg.AdminToken),
+		Config:   cfg,
+		basePath: base,
+		Client:   openlist.New(loopback, cfg.AdminToken),
 	}
 	if cfg.AdminPassword != "" {
 		s.tokens = openlist.NewTokenManager(s.Client, cfg.AdminUser, cfg.AdminPassword)
@@ -74,6 +93,42 @@ func New(cfg config.Config) (*Server, error) {
 	}
 	s.forward = func(c *gin.Context) { c.Next() }
 	return s, nil
+}
+
+// stripBase removes the configured base path prefix from p, returning the
+// path the feature middleware and guards match on (OpenList's own route
+// paths). Paths that do not carry the prefix are returned unchanged.
+func (s *Server) stripBase(p string) string {
+	if s.basePath == "" {
+		return p
+	}
+	if p == s.basePath {
+		return "/"
+	}
+	if strings.HasPrefix(p, s.basePath+"/") {
+		return p[len(s.basePath):]
+	}
+	return p
+}
+
+// relPath returns the current request's URL path relative to the base path
+// — the path OpenList's own routes see. The feature middleware computes it
+// once per request and publishes it via ctxRelPath; when that is absent
+// (the middleware has not run yet) it is derived from the request.
+func (s *Server) relPath(c *gin.Context) string {
+	if v, ok := c.Get(ctxRelPath); ok {
+		return v.(string)
+	}
+	return s.stripBase(c.Request.URL.Path)
+}
+
+// pathKind returns the path classification the feature middleware published
+// for this request; kindOther before the middleware has run.
+func (s *Server) pathKind(c *gin.Context) pathKind {
+	if v, ok := c.Get(ctxPathKind); ok {
+		return v.(pathKind)
+	}
+	return kindOther
 }
 
 // adminToken returns a valid admin JWT for forwarding to OpenList's core.
@@ -122,14 +177,20 @@ func (s *Server) Engine(mountOpenList bool) *gin.Engine {
 
 	// Mount OpenList's full route tree onto this engine. In production this
 	// is what makes the extension "work alone" — OpenList runs in-process.
+	// With a base path configured, OpenList's server.Init mounts everything
+	// under e.Group(conf.URL.Path) (from site_url), i.e. under the same
+	// prefix as the extension's own routes below.
 	if mountOpenList {
 		olInit(r)
 	}
 
-	// Extension health + admin API. The feature middleware above skips
-	// /ext/* paths, so these are unaffected by it.
-	r.GET("/ext/healthz", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
-	admin := r.Group("/ext/admin", s.adminAuth())
+	// Extension health + admin API + curl upload, mounted under the same
+	// base path as OpenList's routes (a no-op group at root deployments).
+	// The feature middleware above skips /ext/* paths, so those are
+	// unaffected by it.
+	g := r.Group(s.basePath)
+	g.GET("/ext/healthz", func(c *gin.Context) { c.JSON(200, gin.H{"ok": true}) })
+	admin := g.Group("/ext/admin", s.adminAuth())
 	s.registerAdminRoutes(admin)
 
 	// curl-friendly streaming upload + download link (PUT/POST /upload/<path>).
@@ -137,12 +198,60 @@ func (s *Server) Engine(mountOpenList bool) *gin.Engine {
 	// its own API-key/admin-token auth. It is also not a file-op path, so the
 	// feature middleware passes it straight through to this handler.
 	upload := s.curlUpload
-	r.PUT("/upload", upload)
-	r.PUT("/upload/*path", upload)
-	r.POST("/upload", upload)
-	r.POST("/upload/*path", upload)
+	g.PUT("/upload", upload)
+	g.PUT("/upload/*path", upload)
+	g.POST("/upload", upload)
+	g.POST("/upload/*path", upload)
 
 	return r
+}
+
+// Handler returns the http.Handler for the whole service: the gin engine
+// built by Engine(mountOpenList), wrapped for subpath deployments.
+//
+// Reverse proxies differ in whether they pass the subpath through or strip
+// it: nginx "location /files/ { proxy_pass http://backend; }" forwards
+// /files/api/... unchanged, while a trailing-slash proxy_pass, caddy's
+// handle_path, and Apache's ProxyPass all strip the prefix and deliver
+// /api/... . The engine routes are registered under the base path either
+// way, so the wrapper re-adds the prefix to requests that arrive without
+// it before the engine routes them — both proxy styles then work with the
+// same SITE_URL setting, and URLs the service generates (download links,
+// redirects) always carry the prefix.
+func (s *Server) Handler(mountOpenList bool) http.Handler {
+	engine := s.Engine(mountOpenList)
+	if s.basePath == "" {
+		return engine
+	}
+	prefix := s.basePath
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI == "*" ||
+			r.URL.Path == prefix ||
+			strings.HasPrefix(r.URL.Path, prefix+"/") {
+			engine.ServeHTTP(w, r)
+			return
+		}
+		// The proxy stripped the subpath; re-add it before routing — on a
+		// CLONE of the request, mirroring http.StripPrefix: net/http's
+		// contract says handlers must not modify the provided *http.Request,
+		// and readers of r.RequestURI (OpenList's static asset cache
+		// headers, logging, dumps) expect a request-target consistent with
+		// r.URL. Only origin-form targets get a rewritten RequestURI;
+		// absolute-form requests (rare, from misconfigured proxies) keep
+		// theirs, since it is not the path being routed. Path and RawPath
+		// get the same constant prefix so escaped forms stay valid (RawPath
+		// is only set when the request used non-canonical escapes, e.g.
+		// %2F).
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = prefix + r.URL.Path
+		if r.URL.RawPath != "" {
+			r2.URL.RawPath = prefix + r.URL.RawPath
+		}
+		if r2.RequestURI != "" && r2.RequestURI[0] == '/' {
+			r2.RequestURI = prefix + r2.RequestURI
+		}
+		engine.ServeHTTP(w, r2)
+	})
 }
 
 // featureMiddleware is the ordered feature chain. It short-circuits
@@ -153,14 +262,21 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 	domain := s.domainAuth()
 	listPerm := s.listPermGuard()
 	return func(c *gin.Context) {
-		// Never touch extension-internal paths.
-		if strings.HasPrefix(c.Request.URL.Path, "/ext/") {
-			c.Next()
-			return
-		}
-		// Only engage the feature chain on file-operation paths. Other
-		// OpenList routes (auth, admin, webdav, etc.) pass straight through.
-		if !isFileOpPath(c.Request.URL.Path) {
+		// Normalize the request path ONCE, relative to the base path —
+		// under a subpath deployment every request arrives as
+		// <base>/api/..., so matching OpenList's route paths requires the
+		// prefix stripped first — and publish path + classification in the
+		// context. Guards consume those (relPath / pathKind) instead of
+		// each re-reading c.Request.URL.Path, so a future guard cannot
+		// accidentally work on the prefixed form.
+		rel := s.stripBase(c.Request.URL.Path)
+		c.Set(ctxRelPath, rel)
+		kind := classifyPath(rel)
+		c.Set(ctxPathKind, kind)
+		// Never touch extension-internal paths; engage the feature chain
+		// only on file-operation paths. Other OpenList routes (auth,
+		// admin, webdav, ...) pass straight through.
+		if kind == kindExt || kind == kindOther {
 			c.Next()
 			return
 		}
@@ -179,7 +295,7 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 		// Load-balanced uploads are handled entirely in-process by lbUpload
 		// (it writes the response and aborts); otherwise apply TTL wrapping
 		// around the forwarder.
-		if isLBUpload(c) {
+		if s.isLBUpload(c) {
 			s.lbUpload(c)
 			return
 		}
@@ -187,27 +303,46 @@ func (s *Server) featureMiddleware() gin.HandlerFunc {
 	}
 }
 
-// isFileOpPath reports whether a path is a file operation the feature chain
-// governs: /api/fs/* (list/get/put/remove/mkdir/...), /d/* and /p/*
-// downloads.
-func isFileOpPath(p string) bool {
+// pathKind classifies a request's URL path — base-path-relative, i.e.
+// OpenList's own route path — for the feature middleware. The zero value
+// kindOther means "not a path the feature chain governs".
+type pathKind int
+
+const (
+	kindOther    pathKind = iota
+	kindExt               // the extension's own /ext/* routes
+	kindAPIFS             // /api/fs/* (list/get/put/remove/mkdir/...)
+	kindDownload          // direct file downloads: /d, /p, /ad, /ap, /ae, /sd, /sad
+)
+
+// classifyPath maps a base-path-relative request path to its pathKind. The
+// download prefixes enumerate exactly the direct download routes OpenList's
+// server/router.go registers: plain downloads /d and proxy downloads /p,
+// archive downloads /ad (download), /ap (proxy), /ae (in-archive extract),
+// and share downloads /sd and /sad — kept in sync with the same list as
+// isDownloadPath. If OpenList adds a download route, this classifier (and
+// only it) needs the new prefix.
+func classifyPath(p string) pathKind {
+	if strings.HasPrefix(p, "/ext/") {
+		return kindExt
+	}
 	if strings.HasPrefix(p, "/api/fs/") {
-		return true
+		return kindAPIFS
 	}
-	if strings.HasPrefix(p, "/d/") || strings.HasPrefix(p, "/p/") {
-		return true
+	if isDownloadPath(p) {
+		return kindDownload
 	}
-	return false
+	return kindOther
 }
 
 // isLBUpload reports whether the current request is an upload that should
 // be load-balanced. The caller signals this by setting the
 // "X-LB-Group" header (or query param) on the upload request.
-func isLBUpload(c *gin.Context) bool {
+func (s *Server) isLBUpload(c *gin.Context) bool {
 	if c.Request.Method != http.MethodPut {
 		return false
 	}
-	if !strings.HasSuffix(c.Request.URL.Path, "/fs/put") {
+	if s.pathKind(c) != kindAPIFS || !strings.HasSuffix(s.relPath(c), "/fs/put") {
 		return false
 	}
 	return c.GetHeader("X-LB-Group") != "" || c.Query("lb_group") != ""

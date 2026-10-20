@@ -1,9 +1,11 @@
 package server
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	stdpath "path"
 	"strconv"
 	"strings"
 	"time"
@@ -43,12 +45,14 @@ import (
 // routes through an LB group, X-Ttl sets a per-file TTL override, and a
 // TTL record is created when the user has TTL enabled.
 //
-// The response carries a same-origin download link (GET /d/<path>) built
-// from the request's own host, so it works behind proxies and for any
-// storage driver. When OpenList requires signed downloads (sign-all,
-// storage sign, or a password-protected meta), the sign is fetched via
-// /api/fs/get — it is derived from the path alone, so the admin-fetched
-// value equals what any user would receive — and embedded as ?sign=.
+// The response carries a download link (GET /d/<path>) built the same way
+// OpenList's own link building works: pinned to the configured origin when
+// SITE_URL is a full URL, otherwise derived from the request's host — so
+// it works behind proxies, under subpaths, and for any storage driver.
+// When OpenList requires signed downloads (sign-all, storage sign, or a
+// password-protected meta), the sign is fetched via /api/fs/get — it is
+// derived from the path alone, so the admin-fetched value equals what any
+// user would receive — and embedded as ?sign=.
 func (s *Server) curlUpload(c *gin.Context) {
 	// Resolve the identity: API key first, then the static admin token.
 	var (
@@ -154,29 +158,41 @@ func (s *Server) curlUpload(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"code": 200, "message": "success", "data": gin.H{
 		"path": targetPath,
-		"url":  downloadURL(c, targetPath, sign),
+		"url":  s.downloadURL(c, targetPath, sign),
 		"sign": sign,
 		"size": size,
 	}})
 }
 
-// downloadURL builds the /d/<path> link served by this engine. Scheme and
-// host come from the request itself (X-Forwarded-Proto / X-Forwarded-Host
-// when behind a proxy, else r.TLS / r.Host), matching how OpenList's own
-// common.GetApiUrlFromRequest builds download URLs. The path is re-escaped
-// per segment from the decoded logical path — the same encoding OpenList's
-// utils.EncodePath(_, true) applies — so a round trip through /d/ resolves
-// to the uploaded file.
-func downloadURL(c *gin.Context, path, sign string) string {
-	scheme := "http"
-	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
-		scheme = "https"
+// downloadURL builds the /d/<path> link served by this engine, mirroring
+// OpenList's own common.GetApiUrlFromRequest: when SITE_URL is a full URL
+// the link is pinned to that origin (the declared public address of the
+// service); otherwise scheme and host come from the request itself
+// (X-Forwarded-Proto / X-Forwarded-Host when behind a proxy, else r.TLS /
+// r.Host) with the base path joined on. The site URL is read from the
+// extension's own Config, canonicalized by the SAME upstream normalizer
+// OpenList's bootstrap applies to site_url (config.CanonicalSiteURL), so
+// the two link builders agree without the extension reaching into
+// OpenList's process-global config (not importable, and unset in tests).
+// The path is re-escaped per segment from the decoded logical path — the
+// same encoding OpenList's utils.EncodePath(_, true) applies — so a round
+// trip through /d/ resolves to the uploaded file.
+func (s *Server) downloadURL(c *gin.Context, path, sign string) string {
+	api := s.Config.CanonicalSiteURL()
+	if strings.HasPrefix(api, "http") {
+		api = strings.TrimSuffix(api, "/")
+	} else {
+		scheme := "http"
+		if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+			scheme = "https"
+		}
+		host := c.GetHeader("X-Forwarded-Host")
+		if host == "" {
+			host = c.Request.Host
+		}
+		api = fmt.Sprintf("%s://%s", scheme, stdpath.Join(host, api))
 	}
-	host := c.GetHeader("X-Forwarded-Host")
-	if host == "" {
-		host = c.Request.Host
-	}
-	u := scheme + "://" + host + "/d" + escapeURLPath(path)
+	u := api + "/d" + escapeURLPath(path)
 	if sign != "" {
 		u += "?sign=" + url.QueryEscape(sign)
 	}

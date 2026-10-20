@@ -38,15 +38,17 @@ func TestIntegration_BootsOpenListInProcess(t *testing.T) {
 	require.NoError(t, db.Init(extDB))
 	defer db.Close()
 
-	// Boot OpenList's internals in-process against the temp data dir.
+	// Boot OpenList's internals in-process against the temp data dir, with
+	// a subpath to prove the base-path plumbing end to end.
 	t.Log("booting openlist in-process")
-	require.NoError(t, BootOpenList(dataDir))
+	require.NoError(t, BootOpenList(dataDir, "/files"))
 	t.Log("openlist booted")
 
 	cfg := config.Default()
 	cfg.DataDir = dataDir
 	cfg.DBPath = extDB
 	cfg.AdminToken = "integration-admin"
+	cfg.SiteURL = "/files"
 	srv, err := New(cfg)
 	require.NoError(t, err)
 	t.Log("server constructed")
@@ -54,23 +56,24 @@ func TestIntegration_BootsOpenListInProcess(t *testing.T) {
 	// Mount OpenList's REAL routes (no stub forwarder).
 	t.Log("mounting openlist routes")
 	engine := srv.Engine(true)
-	t.Log("routes mounted")
 	ts := httptest.NewServer(engine)
 	defer ts.Close()
 	t.Log("test server started at", ts.URL)
 
-	// OpenList's server.Init registers GET /ping -> "pong". Hitting it through
-	// the extension engine proves OpenList is embedded and serving in-process.
-	resp, err := http.Get(ts.URL + "/ping")
+	// OpenList's server.Init registers GET /ping -> "pong" — under the
+	// configured base path. Hitting it through the extension engine proves
+	// OpenList is embedded and serving in-process under the subpath.
+	resp, err := http.Get(ts.URL + "/files/ping")
 	require.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode)
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	resp.Body.Close()
-	assert.Equal(t, "pong", string(body), "OpenList /ping should be served by the embedded engine")
+	assert.Equal(t, "pong", string(body), "OpenList /ping should be served by the embedded engine under the base path")
 
-	// The extension's own healthz must coexist on the same engine.
-	resp, err = http.Get(ts.URL + "/ext/healthz")
+	// The extension's own healthz must coexist on the same engine, also
+	// under the base path.
+	resp, err = http.Get(ts.URL + "/files/ext/healthz")
 	require.NoError(t, err)
 	assert.Equal(t, 200, resp.StatusCode)
 	resp.Body.Close()
